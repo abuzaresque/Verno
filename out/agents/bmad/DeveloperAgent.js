@@ -36,10 +36,15 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.DeveloperAgent = void 0;
 const BaseAgent_1 = require("../base/BaseAgent");
 const feedback_1 = require("../../services/feedback");
+const VectorStore_1 = require("../../services/rag/VectorStore");
+const EmbeddingService_1 = require("../../services/rag/EmbeddingService");
+const IndexingService_1 = require("../../services/rag/IndexingService");
+const ImportTracer_1 = require("../../services/rag/ImportTracer");
+const ContextEngine_1 = require("../../services/rag/ContextEngine");
+const SymbolChunker_1 = require("../../services/rag/SymbolChunker");
 const childProcess = __importStar(require("child_process"));
 const util = __importStar(require("util"));
 const fs = __importStar(require("fs"));
-const path = __importStar(require("path"));
 const exec = util.promisify(childProcess.exec);
 /**
  * Enhanced Developer Agent with Test Execution and Quality Checks
@@ -53,12 +58,27 @@ class DeveloperAgent extends BaseAgent_1.BaseAgent {
     name = 'developer';
     description = 'Developer - Senior software engineer, code implementation, testing, quality assurance';
     feedbackService;
+    indexingService;
+    importTracer;
+    contextEngine;
     constructor(logger, llmService, fileService, changeTracker) {
         super(logger);
         this.logger = logger;
         this.llmService = llmService;
         this.fileService = fileService;
         this.changeTracker = changeTracker;
+    }
+    // Late initialization to access workspace context dynamically
+    lazyInitRagServices(workspaceRoot) {
+        if (this.contextEngine)
+            return;
+        const vectorStore = new VectorStore_1.VectorStore();
+        const embeddingService = new EmbeddingService_1.EmbeddingService();
+        // extensionPath fallback: use workspaceRoot if no extension context available
+        const symbolChunker = new SymbolChunker_1.SymbolChunker(workspaceRoot);
+        this.indexingService = new IndexingService_1.IndexingService(vectorStore, embeddingService, symbolChunker, workspaceRoot);
+        this.importTracer = new ImportTracer_1.ImportTracer(workspaceRoot);
+        this.contextEngine = new ContextEngine_1.ContextEngine(this.importTracer, this.indexingService, workspaceRoot);
     }
     async execute(context) {
         this.log('Running Developer (Amelia) - Implementation with Quality Checks');
@@ -77,14 +97,22 @@ class DeveloperAgent extends BaseAgent_1.BaseAgent {
         const conversationHistory = context.metadata?.conversationHistory || '';
         const projectContext = context.metadata?.projectContext || '';
         const editMode = !!context.metadata?.editMode;
-        // Collect existing file contents when in edit mode or when files exist
+        const userRequest = context.metadata?.userRequest || 'implement feature';
+        // Retrieve high-density Tiered Context via Import Graph + Local RAG pipeline
         let existingFilesContext = '';
         if (context.workspaceRoot) {
-            existingFilesContext = this.collectExistingFiles(context.workspaceRoot);
+            this.lazyInitRagServices(context.workspaceRoot);
+            if (this.indexingService && this.contextEngine) {
+                this.log('Building Structural/Semantic Context...');
+                // Fire-and-forget background indexing (Tier 2 baseline)
+                this.indexingService.indexWorkspace(context.workspaceRoot, this);
+                // Fetch Tier 1 (Structural) + Tier 2 (Vector Fallback)
+                existingFilesContext = await this.contextEngine.getTieredContext(userRequest, 8);
+                this.log(`Retrieved Tiered context chunks. Size: ${existingFilesContext.length} chars`);
+            }
         }
         const hasExistingCode = existingFilesContext.length > 0;
         // Detect target language from the user request
-        const userRequest = context.metadata?.userRequest || 'implement feature';
         const detectedLang = this.detectLanguage(userRequest);
         // Build the prompt based on mode
         let prompt;
@@ -523,62 +551,6 @@ For new files:
 \`\`\`
 
 You MUST output code using the format above. Do not describe what you would do. Write the actual code.`;
-    }
-    /**
-     * Collect existing source files from the workspace for context
-     */
-    collectExistingFiles(workspaceRoot) {
-        const codeExtensions = new Set(['.ts', '.tsx', '.js', '.jsx', '.py', '.java', '.go', '.rs', '.css', '.html']);
-        const ignoreDirs = new Set(['node_modules', '.git', '.vscode', 'out', 'dist', 'build', '.verno', '.next', 'coverage']);
-        const maxFiles = 15;
-        const maxFileSize = 3000;
-        const files = [];
-        const scan = (dir) => {
-            if (files.length >= maxFiles) {
-                return;
-            }
-            try {
-                const entries = fs.readdirSync(dir, { withFileTypes: true });
-                for (const entry of entries) {
-                    if (files.length >= maxFiles) {
-                        break;
-                    }
-                    if (ignoreDirs.has(entry.name)) {
-                        continue;
-                    }
-                    const fullPath = path.join(dir, entry.name);
-                    if (entry.isDirectory()) {
-                        scan(fullPath);
-                    }
-                    else if (entry.isFile()) {
-                        const ext = path.extname(entry.name);
-                        if (codeExtensions.has(ext)) {
-                            try {
-                                const content = fs.readFileSync(fullPath, 'utf-8');
-                                const relativePath = path.relative(workspaceRoot, fullPath).replace(/\\/g, '/');
-                                files.push({
-                                    relativePath,
-                                    content: content.length > maxFileSize
-                                        ? content.substring(0, maxFileSize) + '\n... (truncated)'
-                                        : content,
-                                });
-                            }
-                            catch {
-                                // Skip unreadable files
-                            }
-                        }
-                    }
-                }
-            }
-            catch {
-                // Skip inaccessible directories
-            }
-        };
-        scan(workspaceRoot);
-        if (files.length === 0) {
-            return '';
-        }
-        return files.map(f => `### ${f.relativePath}\n\`\`\`\n${f.content}\n\`\`\``).join('\n\n');
     }
 }
 exports.DeveloperAgent = DeveloperAgent;
