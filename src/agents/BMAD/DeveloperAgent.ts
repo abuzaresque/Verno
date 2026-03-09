@@ -5,6 +5,12 @@ import { FileService } from '../../services/file/FileService';
 import { FileChangeTracker } from '../../services/file/FileChangeTracker';
 import { FeedbackService, IssueSeverity } from '../../services/feedback';
 import { ProjectAnalyzer } from '../../services/project';
+import { VectorStore } from '../../services/rag/VectorStore';
+import { EmbeddingService } from '../../services/rag/EmbeddingService';
+import { IndexingService } from '../../services/rag/IndexingService';
+import { ImportTracer } from '../../services/rag/ImportTracer';
+import { ContextEngine } from '../../services/rag/ContextEngine';
+import { SymbolChunker } from '../../services/rag/SymbolChunker';
 import * as childProcess from 'child_process';
 import * as util from 'util';
 import * as fs from 'fs';
@@ -20,6 +26,9 @@ export class DeveloperAgent extends BaseAgent {
   name = 'developer';
   description = 'Developer - Senior software engineer, code implementation, testing, quality assurance';
   private feedbackService?: FeedbackService;
+  private indexingService?: IndexingService;
+  private importTracer?: ImportTracer;
+  private contextEngine?: ContextEngine;
 
   constructor(
     protected logger: any,
@@ -28,6 +37,18 @@ export class DeveloperAgent extends BaseAgent {
     private changeTracker: FileChangeTracker
   ) {
     super(logger);
+  }
+
+  // Late initialization to access workspace context dynamically
+  private lazyInitRagServices(workspaceRoot: string) {
+    if (this.contextEngine) return;
+    const vectorStore = new VectorStore();
+    const embeddingService = new EmbeddingService();
+    // extensionPath fallback: use workspaceRoot if no extension context available
+    const symbolChunker = new SymbolChunker(workspaceRoot);
+    this.indexingService = new IndexingService(vectorStore, embeddingService, symbolChunker, workspaceRoot);
+    this.importTracer = new ImportTracer(workspaceRoot);
+    this.contextEngine = new ContextEngine(this.importTracer, this.indexingService, workspaceRoot);
   }
 
   async execute(context: IAgentContext): Promise<string> {
@@ -50,16 +71,25 @@ export class DeveloperAgent extends BaseAgent {
     const conversationHistory = (context.metadata?.conversationHistory as string) || '';
     const projectContext = (context.metadata?.projectContext as string) || '';
     const editMode = !!context.metadata?.editMode;
+    const userRequest = context.metadata?.userRequest as string || 'implement feature';
 
-    // Collect existing file contents when in edit mode or when files exist
+    // Retrieve high-density Tiered Context via Import Graph + Local RAG pipeline
     let existingFilesContext = '';
     if (context.workspaceRoot) {
-      existingFilesContext = this.collectExistingFiles(context.workspaceRoot);
+      this.lazyInitRagServices(context.workspaceRoot);
+      if (this.indexingService && this.contextEngine) {
+        this.log('Building Structural/Semantic Context...');
+        // Fire-and-forget background indexing (Tier 2 baseline)
+        this.indexingService.indexWorkspace(context.workspaceRoot, this);
+
+        // Fetch Tier 1 (Structural) + Tier 2 (Vector Fallback)
+        existingFilesContext = await this.contextEngine.getTieredContext(userRequest, 8);
+        this.log(`Retrieved Tiered context chunks. Size: ${existingFilesContext.length} chars`);
+      }
     }
     const hasExistingCode = existingFilesContext.length > 0;
 
     // Detect target language from the user request
-    const userRequest = context.metadata?.userRequest as string || 'implement feature';
     const detectedLang = this.detectLanguage(userRequest);
 
     // Build the prompt based on mode
@@ -576,54 +606,5 @@ For new files:
 You MUST output code using the format above. Do not describe what you would do. Write the actual code.`;
   }
 
-  /**
-   * Collect existing source files from the workspace for context
-   */
-  private collectExistingFiles(workspaceRoot: string): string {
-    const codeExtensions = new Set(['.ts', '.tsx', '.js', '.jsx', '.py', '.java', '.go', '.rs', '.css', '.html']);
-    const ignoreDirs = new Set(['node_modules', '.git', '.vscode', 'out', 'dist', 'build', '.verno', '.next', 'coverage']);
-    const maxFiles = 15;
-    const maxFileSize = 3000;
-    const files: Array<{ relativePath: string; content: string }> = [];
 
-    const scan = (dir: string) => {
-      if (files.length >= maxFiles) { return; }
-      try {
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
-        for (const entry of entries) {
-          if (files.length >= maxFiles) { break; }
-          if (ignoreDirs.has(entry.name)) { continue; }
-
-          const fullPath = path.join(dir, entry.name);
-          if (entry.isDirectory()) {
-            scan(fullPath);
-          } else if (entry.isFile()) {
-            const ext = path.extname(entry.name);
-            if (codeExtensions.has(ext)) {
-              try {
-                const content = fs.readFileSync(fullPath, 'utf-8');
-                const relativePath = path.relative(workspaceRoot, fullPath).replace(/\\/g, '/');
-                files.push({
-                  relativePath,
-                  content: content.length > maxFileSize
-                    ? content.substring(0, maxFileSize) + '\n... (truncated)'
-                    : content,
-                });
-              } catch {
-                // Skip unreadable files
-              }
-            }
-          }
-        }
-      } catch {
-        // Skip inaccessible directories
-      }
-    };
-
-    scan(workspaceRoot);
-
-    if (files.length === 0) { return ''; }
-
-    return files.map(f => `### ${f.relativePath}\n\`\`\`\n${f.content}\n\`\`\``).join('\n\n');
-  }
 }
