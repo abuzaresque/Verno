@@ -3,13 +3,20 @@
  * Features: Dynamic providers, conversations history, MCP marketplace, settings panel
  */
 
-export function getConversationHTML(nonce: string): string {
+interface VadPaths {
+    bundlePath: string;
+    workletPath: string;
+    modelPath: string;
+    wasmRoot: string;
+}
+
+export function getConversationHTML(nonce: string, vadPaths?: VadPaths): string {
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}' blob:; connect-src vscode-webview-resource: https:; worker-src blob:; media-src vscode-webview-resource: https: blob: mediastream:;">
     <style>
         :root {
             --bg: var(--vscode-sideBar-background);
@@ -220,8 +227,9 @@ export function getConversationHTML(nonce: string): string {
 
         /* Record button */
         .voice-record-btn { padding: 10px 24px; border: none; border-radius: 20px; background: #00ff88; color: #000; font-size: 12px; font-weight: 700; cursor: pointer; transition: all 0.15s; display: flex; align-items: center; gap: 6px; }
-        .voice-record-btn:hover { transform: scale(1.05); box-shadow: 0 0 15px rgba(0,255,136,0.4); }
+        .voice-record-btn:hover:not(:disabled) { transform: scale(1.05); box-shadow: 0 0 15px rgba(0,255,136,0.4); }
         .voice-record-btn.recording { background: #ff4757; color: white; animation: pulseRed 2s infinite; }
+        .voice-record-btn.processing { background: #b388ff; color: #000; }
         .voice-record-btn .btn-icon { font-size: 10px; }
         @keyframes pulseRed { 0% { box-shadow: 0 0 0 0 rgba(255, 71, 87, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(255, 71, 87, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 71, 87, 0); } }
 
@@ -231,7 +239,9 @@ export function getConversationHTML(nonce: string): string {
         .voice-fallback input { flex: 1; padding: 8px 12px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; color: #fff; font-size: 12px; font-family: inherit; }
         .voice-fallback input:focus { outline: 1px solid #00ff88; border-color: #00ff88; }
         .voice-fallback button { padding: 8px 14px; background: linear-gradient(135deg, #00ff88, #00c8ff); border: none; border-radius: 8px; color: #000; font-size: 11px; font-weight: 700; cursor: pointer; }
+        .voice-fallback button { padding: 8px 14px; background: linear-gradient(135deg, #00ff88, #00c8ff); border: none; border-radius: 8px; color: #000; font-size: 11px; font-weight: 700; cursor: pointer; }
     </style>
+    ${vadPaths ? `<script nonce="${nonce}" src="${vadPaths.bundlePath}"></script>` : ''}
 </head>
 <body>
     <div class="header">
@@ -412,6 +422,7 @@ export function getConversationHTML(nonce: string): string {
     <script nonce="${nonce}">
     (function(){
         var vscode = acquireVsCodeApi();
+        var vadPaths = ${vadPaths ? JSON.stringify(vadPaths) : 'null'};
         var saved = vscode.getState();
         var S = { mode:'plan', model:'gemini', providers:[], starred:[], mcpInstalled:[], settings:{}, customModes:[], workflows:[], rules:[], mcpGlobal:[], mcpWorkspace:[] };
         if(saved){
@@ -826,11 +837,13 @@ export function getConversationHTML(nonce: string): string {
             var transcript = [];
             var isListening = false;
             var isSpeaking = false;
+            var isProcessing = false;
             var ttsSupported = false;
             var bestVoice = null;
             var waveBars = [];
             var speakTimer = null;
             var silenceTimer = null;
+            var safetyTimeout = null;
             // "Silence" timeout: Since we can't do real VAD in webview easily, 
             // we auto-stop after 15s of recording to prevent indefinite hanging.
             var MAX_RECORD_DURATION = 15000; 
@@ -912,17 +925,73 @@ function log(msg) {
 // --- RECORDING CONTROL ---
 
 var recordingTimeout = null;
+var myvad = null;
+
+async function initVAD() {
+    if (myvad || !window.vad) return;
+    try {
+        log('Initializing WebAssembly VAD...');
+        myvad = await window.vad.MicVAD.new({
+            workletURL: vadPaths ? vadPaths.workletPath : '',
+            modelURL: vadPaths ? vadPaths.modelPath : '',
+            ortConfig: {
+                wasmPaths: {
+                    "ort-wasm.wasm": vadPaths ? vadPaths.wasmRoot + 'ort-wasm.wasm' : '',
+                    "ort-wasm-simd.wasm": vadPaths ? vadPaths.wasmRoot + 'ort-wasm-simd.wasm' : '',
+                    "ort-wasm-threaded.wasm": vadPaths ? vadPaths.wasmRoot + 'ort-wasm-threaded.wasm' : '',
+                    "ort-wasm-simd-threaded.wasm": vadPaths ? vadPaths.wasmRoot + 'ort-wasm-simd-threaded.wasm' : ''
+                }
+            },
+            onSpeechStart: function() {
+                log('Speech started.');
+                setStatus('listening', 'Hearing you...');
+                setWaveActive(true);
+            },
+            onSpeechEnd: function(audio) {
+                log('Speech ended. Processing Int16 PCM...');
+                setWaveActive(false);
+                setStatus('thinking', 'Processing...');
+                
+                var int16Array = new Int16Array(audio.length);
+                for (var i = 0; i < audio.length; i++) {
+                    var s = Math.max(-1, Math.min(1, audio[i]));
+                    int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                
+                vscode.postMessage({ type: 'vadAudioData', audioData: Array.from(int16Array) });
+                stopListening();
+            },
+            onVADMisfire: function() {
+                log('VAD misfire (too short).');
+            }
+        });
+        log('VAD initialized successfully.');
+    } catch (e) {
+        log('VAD Init Error: ' + e);
+    }
+}
 
 function startListening() {
-    if (isSpeaking || isListening) return;
-
-    vscode.postMessage({ type: 'startRecording' });
+    if (isSpeaking || isListening || isProcessing) return;
 
     isListening = true;
     log('Starting native recording...');
-    setStatus('listening', 'Listening...');
-    setWaveActive(true);
+    setStatus('listening', 'Initializing Mic...');
     updateRecordBtn(true);
+
+    if (!myvad) {
+        initVAD().then(function() {
+            if (isListening && myvad) {
+                myvad.start();
+                setStatus('listening', 'Listening...');
+                setWaveActive(true);
+            }
+        });
+    } else {
+        myvad.start();
+        setStatus('listening', 'Listening...');
+        setWaveActive(true);
+    }
 
     // Auto-stop after MAX_RECORD_DURATION
     if (recordingTimeout) clearTimeout(recordingTimeout);
@@ -937,8 +1006,9 @@ function startListening() {
 function stopListening() {
     if (isListening) {
         log('Stopping native recording...');
-        vscode.postMessage({ type: 'stopRecording' });
         isListening = false;
+        
+        if (myvad) myvad.pause();
 
         if (recordingTimeout) { clearTimeout(recordingTimeout); recordingTimeout = null; }
 
@@ -965,12 +1035,24 @@ function setWaveActive(active) {
 function updateRecordBtn(recording) {
     var btn = document.getElementById('voiceRecordBtn');
     if (!btn) return;
-    if (recording) {
-        btn.innerHTML = '<span class="btn-icon">■</span> <span class="btn-text">Stop Recording</span>';
-        btn.className = 'voice-record-btn recording';
+    
+    if (isProcessing) {
+        btn.innerHTML = '<span class="btn-icon">⌛</span> <span class="btn-text">Thinking...</span>';
+        btn.className = 'voice-record-btn processing';
+        btn.style.opacity = '0.7';
+        btn.disabled = true;
+        btn.style.cursor = 'not-allowed';
     } else {
-        btn.innerHTML = '<span class="btn-icon">●</span> <span class="btn-text">Start Recording</span>';
-        btn.className = 'voice-record-btn';
+        btn.disabled = false;
+        btn.style.opacity = '1';
+        btn.style.cursor = 'pointer';
+        if (recording) {
+            btn.innerHTML = '<span class="btn-icon">■</span> <span class="btn-text">Stop Recording</span>';
+            btn.className = 'voice-record-btn recording';
+        } else {
+            btn.innerHTML = '<span class="btn-icon">●</span> <span class="btn-text">Start Recording</span>';
+            btn.className = 'voice-record-btn';
+        }
     }
 }
 
@@ -1012,6 +1094,10 @@ window.handleVoiceTranscript = function (text) {
         return;
     }
 
+    // Lock UI while text is being processed by the backend agent
+    isProcessing = true;
+    updateRecordBtn(false);
+
     // Add to transcript
     transcript.push({ role: 'user', text: text });
     addTranscriptTurn('user', text);
@@ -1019,9 +1105,37 @@ window.handleVoiceTranscript = function (text) {
     // Send to Agent
     setStatus('thinking', 'Agent is thinking...');
     submitToAgent(text);
+
+    // Safety valve — unlock after 30 seconds no matter what
+    if (safetyTimeout) clearTimeout(safetyTimeout);
+    safetyTimeout = setTimeout(() => {
+        if (isProcessing) {
+            isProcessing = false;
+            updateRecordBtn(isListening);
+            console.warn('[VoiceChatEngine] Mutex force-released after timeout');
+            setStatus('ready', 'Click Record to speak');
+        }
+    }, 30000);
+}
+
+window.handleThinkingState = function(isThinking) {
+    if (isProcessing !== isThinking) {
+        isProcessing = isThinking;
+        if (!isThinking) {
+            if (safetyTimeout) {
+                clearTimeout(safetyTimeout);
+                safetyTimeout = null;
+            }
+            if (!isListening && !isSpeaking) {
+                setStatus('ready', 'Click Record to speak');
+            }
+        }
+        updateRecordBtn(isListening);
+    }
 }
 
 window.handleVoiceError = function (msg) {
+    isProcessing = false;
     setStatus('thinking', 'Error: ' + msg);
     updateRecordBtn(false);
     if (recordingTimeout) clearTimeout(recordingTimeout);
@@ -1102,6 +1216,9 @@ window.addEventListener('message', event => {
     // Hook into newMessage for TTS
     else if (m.type === 'newMessage' && m.message) {
         window.handleNewMessage(m.message.role, m.message.content);
+    }
+    else if (m.type === 'thinking') {
+        if (window.handleThinkingState) window.handleThinkingState(m.show);
     }
     else if (m.type === 'restoreVoiceSession') {
         // Restore UI without greeting

@@ -131,7 +131,7 @@ class SidebarProvider {
                             // PREFER GROQ WHISPER IF AVAILABLE
                             // Check for configured Groq Key first
                             const config = vscode.workspace.getConfiguration('verno');
-                            let groqKey = config.get('groqApiKey') || this.sessionVoiceKey;
+                            let groqKey = (await this.context.secrets.get('groqApiKey')) || this.sessionVoiceKey;
                             // If not in config, check .env in workspace root
                             if (!groqKey && vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
                                 try {
@@ -184,8 +184,8 @@ class SidebarProvider {
                                         transcriptionProvider = groqProvider;
                                         // Cache and SAVE the key
                                         this.sessionVoiceKey = inputKey;
-                                        await config.update('groqApiKey', inputKey, vscode.ConfigurationTarget.Global);
-                                        this.logger.info('[Sidebar] Saved Groq key to configuration');
+                                        await this.context.secrets.store('groqApiKey', inputKey);
+                                        this.logger.info('[Sidebar] Saved Groq key to SecretStorage');
                                     }
                                     else if (inputKey.startsWith('AIza')) {
                                         const { GeminiProvider } = require('../../services/llm/providers/GeminiProvider');
@@ -212,7 +212,7 @@ class SidebarProvider {
                             else {
                                 const msg = transcriptionProvider
                                     ? `Current provider (${transcriptionProvider.constructor.name}) does not support audio transcription`
-                                    : 'No API Key configured for Voice. Set "verno.groqApiKey" in settings or start a chat session first.';
+                                    : 'No API Key configured for Voice. Start a voice session to configure.';
                                 vscode.window.showWarningMessage(msg);
                                 webviewView.webview.postMessage({ type: 'voiceError', message: msg });
                             }

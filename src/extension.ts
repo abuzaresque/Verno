@@ -1,4 +1,7 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { Logger } from './utils/logger';
 import { ConfigService } from './config/ConfigService';
 import { LLMService, GeminiProvider, GroqProvider } from './services/llm';
@@ -14,6 +17,11 @@ import { RecordingStatus } from './ui/statusBar/RecordingStatus';
 import { AgentPanel } from './ui/panels/AgentPanel';
 import { SidebarProvider } from './ui/panels/SidebarProvider';
 import { EnhancedSidebarProvider } from './ui/panels/EnhancedSidebarProvider';
+import { ConversationEngine } from './services/conversationEngine';
+import { TTSService } from './services/ttsService';
+import { LocalWhisperService } from './services/localWhisperService';
+import { setLocalWhisperInstance, setGroqProviderInstance } from './services/audioRouter';
+import { AudioSanitizer } from './services/audioSanitizer';
 
 let logger: Logger;
 let configService: ConfigService;
@@ -24,7 +32,35 @@ let recordingStatus: RecordingStatus;
 let agentPanel: AgentPanel;
 let sidebarProvider: SidebarProvider;
 let conversationService: ConversationService;
+let brain: ConversationEngine;
+let tts: TTSService;
+let localWhisper: LocalWhisperService;
+let audioSanitizer: AudioSanitizer;
 let currentConversationId: string | null = null;
+
+async function cleanupStaleAudioFiles(logger: Logger) {
+	try {
+		const tmpDir = os.tmpdir();
+		const files = await fs.promises.readdir(tmpDir);
+		const staleFiles = files.filter(f => f.startsWith('verno_recording_') && f.endsWith('.wav'));
+
+		let deletedCount = 0;
+		for (const file of staleFiles) {
+			const filePath = path.join(tmpDir, file);
+			try {
+				await fs.promises.unlink(filePath);
+				deletedCount++;
+			} catch (err) {
+				logger.warn(`Failed to delete stale audio file ${file}: ${err}`);
+			}
+		}
+		if (deletedCount > 0) {
+			logger.info(`Cleaned up ${deletedCount} stale audio file(s)`);
+		}
+	} catch (err) {
+		logger.warn(`Could not scan tmpdir for stale audio files: ${err}`);
+	}
+}
 
 export async function activate(context: vscode.ExtensionContext) {
 	try {
@@ -37,8 +73,26 @@ export async function activate(context: vscode.ExtensionContext) {
 		llmService = new LLMService();
 		recordingStatus = new RecordingStatus();
 		agentPanel = new AgentPanel(context);
+		brain = new ConversationEngine();
+		tts = new TTSService();
+		localWhisper = new LocalWhisperService();
+		audioSanitizer = new AudioSanitizer();
 
 		logger.info('Initializing Verno extension...');
+
+		// Cleanup stale audio files left over from previous sessions
+		cleanupStaleAudioFiles(logger);
+
+		// Background-initialize TTS and local Whisper (non-blocking)
+		tts.initialize(context.extensionPath).catch(err => {
+			logger.warn(`TTS background init failed: ${err}`);
+		});
+		localWhisper.initialize(context.extensionPath).then(() => {
+			setLocalWhisperInstance(localWhisper);
+			logger.info('Local Whisper initialized and registered with AudioRouter');
+		}).catch(err => {
+			logger.warn(`Local Whisper background init failed: ${err}`);
+		});
 
 		// Initialize ConversationService for persistence
 		const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
@@ -177,7 +231,63 @@ export async function activate(context: vscode.ExtensionContext) {
 			}
 		});
 
-		context.subscriptions.push(processCommand, processWithData, showOutputCmd, recordingStatus, loadConversationCmd, newTaskCmd, mcpInstallCmd, listConvsCmd, deleteConvCmd, voiceConvCmd);
+		// Process voice input command — the core conversational loop entry point
+		const processVoiceCmd = vscode.commands.registerCommand('verno.processVoiceInput', async (transcribedText: string) => {
+			if (!transcribedText || transcribedText.trim().length === 0) {
+				logger.warn('Empty voice input received');
+				return;
+			}
+
+			// Show transcription in status bar
+			vscode.window.setStatusBarMessage(`🎙️ "${transcribedText}"`, 3000);
+			logger.info(`Voice input (raw): "${transcribedText}"`);
+
+			// Sanitize: correct misheard identifiers against active file symbols
+			const sanitizedText = await audioSanitizer.sanitize(transcribedText);
+			if (sanitizedText !== transcribedText) {
+				logger.info(`Voice input (sanitized): "${sanitizedText}"`);
+			}
+
+			try {
+				// Think — LLM generates reply with full workspace context
+				const reply = await brain.think(sanitizedText);
+
+				// Speak — TTS plays reply out loud
+				tts.speak(reply).catch(err => {
+					logger.warn(`TTS speak failed: ${err}`);
+				});
+
+				// Show in sidebar conversation panel
+				agentPanel.addMessage('user', sanitizedText, { silent: false });
+				agentPanel.addMessage('assistant', reply, { silent: false });
+
+				// Persist to ConversationService
+				if (conversationService) {
+					try {
+						const convId = ensureConversation('ask');
+						conversationService.addMessage(convId, 'user', sanitizedText);
+						conversationService.addMessage(convId, 'assistant', reply);
+					} catch (convErr) {
+						logger.warn(`Conversation persistence error: ${convErr}`);
+					}
+				}
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				logger.error('Voice processing error', err as Error);
+				agentPanel.addMessage('system', `Error: ${msg}`);
+			}
+		});
+
+		// New conversation command — clears history and announces
+		const newConversationCmd = vscode.commands.registerCommand('verno.newConversation', async () => {
+			brain.clearHistory();
+			logger.info('Conversation history cleared');
+			tts.speak('Starting fresh. What are we working on?').catch(err => {
+				logger.warn(`TTS speak failed on new conversation: ${err}`);
+			});
+		});
+
+		context.subscriptions.push(processCommand, processWithData, showOutputCmd, recordingStatus, loadConversationCmd, newTaskCmd, mcpInstallCmd, listConvsCmd, deleteConvCmd, voiceConvCmd, processVoiceCmd, newConversationCmd);
 
 		logger.info('Verno extension activated successfully');
 		vscode.window.showInformationMessage('Verno extension is ready!');
@@ -389,6 +499,8 @@ async function processUserInput(
 
 export function deactivate() {
 	recordingStatus.dispose();
+	try { tts?.dispose(); } catch { /* ignore */ }
+	try { localWhisper?.dispose(); } catch { /* ignore */ }
 	logger.info('Verno extension deactivated');
 	logger.dispose();
 }
