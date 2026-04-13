@@ -38,6 +38,9 @@ import {
   PlanStep,
   CODING_PHASE_AGENTS,
 } from '../../services/planning/PlanStateService';
+import { PRDDocument } from '../../types/sdlc';
+import { ContextBuilder } from '../../services/workflow/ContextBuilder';
+import * as vscode from 'vscode';
 
 /** Available agents the planner can assign */
 const AVAILABLE_AGENTS: Record<string, string> = {
@@ -108,6 +111,43 @@ export class OrchestratorAgent extends BaseAgent {
     this.agentRegistry.register('techwriter', new TechWriterAgent(this.logger, this.llmService, this.fileService, this.changeTracker) as any);
     this.agentRegistry.register('quickflowdev', new QuickFlowSoloDevAgent(this.logger, this.llmService, this.fileService, this.changeTracker) as any);
     this.agentRegistry.register('codereview', new CodeReviewAgent(this.logger, this.llmService, this.fileService, this.changeTracker) as any);
+  }
+
+  // ==========================================
+  // SDLC INTERCEPT AND INJECTION
+  // ==========================================
+
+  public async startSDLCFlow(topic: string): Promise<void> {
+    await vscode.commands.executeCommand('verno.startSDLC', topic);
+  }
+
+  public async onPRDApproved(prd: PRDDocument, context: vscode.ExtensionContext): Promise<void> {
+    this.log('PRD Approved. Triggering BMAD execution pipeline.');
+    
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceRoot) {
+        vscode.window.showErrorMessage('No workspace folder open');
+        return;
+    }
+
+    const prdString = JSON.stringify(prd, null, 2);
+    
+    // Inject PRD into agent context
+    const agentContext = new ContextBuilder()
+        .setWorkspaceRoot(workspaceRoot)
+        .setMetadata({
+            userRequest: `[APPROVED PRD ATTACHED]\n\nPlease implement the features described in this PRD:\n\n${prdString}`,
+            mode: 'plan',
+            timestamp: new Date().toISOString()
+        })
+        .build();
+
+    try {
+        await this.executePlan(agentContext);
+        vscode.window.showInformationMessage('BMAD Planning phase completed based on PRD!');
+    } catch (err: any) {
+        vscode.window.showErrorMessage(`BMAD Pipeline failed: ${err.message}`);
+    }
   }
 
   // ==========================================
@@ -429,6 +469,33 @@ export class OrchestratorAgent extends BaseAgent {
         if (reviewStep) {
           await this.runCodeReviewWithRetry(context, agentOutputs, results, conversationHistory, projectContext);
           // Remove codereview from the loop's remaining steps
+        }
+
+        // Auto-generate unit tests after code generation
+        try {
+          this.log('Auto-generating unit tests for generated code...');
+          const testGenAgent = this.agentRegistry.get('testGenerator');
+          if (testGenAgent) {
+            results.push(`\n## 🧪 Generating Unit Tests...`);
+            const testContext: IAgentContext = {
+              ...context,
+              metadata: {
+                ...context.metadata,
+                codeAnalysis: agentOutputs['developer'],
+              }
+            };
+            const testResult = await testGenAgent.execute(testContext);
+            agentOutputs['testGenerator'] = testResult;
+            results.push(`\n${testResult}`);
+            if (this.planStateService) {
+              this.planStateService.markStepComplete('testGenerator', testResult);
+            }
+            this.log('TestGeneratorAgent completed successfully');
+          }
+        } catch (testErr) {
+          const errMsg = testErr instanceof Error ? testErr.message : String(testErr);
+          this.log(`TestGeneratorAgent failed: ${errMsg}`, 'error');
+          results.push(`\n## ⚠️ Unit Test Generation Skipped\n${errMsg}`);
         }
       }
     }

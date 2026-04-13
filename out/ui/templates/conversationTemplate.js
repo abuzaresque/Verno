@@ -5,13 +5,13 @@
  */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getConversationHTML = getConversationHTML;
-function getConversationHTML(nonce) {
+function getConversationHTML(nonce, vadPaths) {
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}' blob:; connect-src vscode-webview-resource: https:; worker-src blob:; media-src vscode-webview-resource: https: blob: mediastream:;">
     <style>
         :root {
             --bg: var(--vscode-sideBar-background);
@@ -154,7 +154,9 @@ function getConversationHTML(nonce) {
         .tsel:focus { border-color: var(--focus); }
         .right-ctrl { display: flex; gap: 5px; align-items: center; }
         .send-btn { height: 24px; padding: 0 12px; background: var(--btn-bg); color: var(--btn-fg); border: none; border-radius: 3px; font-size: 10px; font-weight: 700; cursor: pointer; }
+        .sdlc-btn { height: 24px; padding: 0 12px; background: #9b59b6; color: white; border: none; border-radius: 3px; font-size: 10px; font-weight: 700; cursor: pointer; }
         .send-btn:hover { background: var(--btn-hover); }
+        .sdlc-btn:hover { filter: brightness(1.1); }
         .api-key-prompt { display: none; margin-top: 6px; padding: 6px 8px; background: var(--quote-bg); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; }
         .api-key-prompt input { margin-top: 3px; width: 100%; padding: 4px; background: var(--input-bg); border: 1px solid var(--border); color: var(--input-fg); font-size: 11px; }
 
@@ -222,8 +224,9 @@ function getConversationHTML(nonce) {
 
         /* Record button */
         .voice-record-btn { padding: 10px 24px; border: none; border-radius: 20px; background: #00ff88; color: #000; font-size: 12px; font-weight: 700; cursor: pointer; transition: all 0.15s; display: flex; align-items: center; gap: 6px; }
-        .voice-record-btn:hover { transform: scale(1.05); box-shadow: 0 0 15px rgba(0,255,136,0.4); }
+        .voice-record-btn:hover:not(:disabled) { transform: scale(1.05); box-shadow: 0 0 15px rgba(0,255,136,0.4); }
         .voice-record-btn.recording { background: #ff4757; color: white; animation: pulseRed 2s infinite; }
+        .voice-record-btn.processing { background: #b388ff; color: #000; }
         .voice-record-btn .btn-icon { font-size: 10px; }
         @keyframes pulseRed { 0% { box-shadow: 0 0 0 0 rgba(255, 71, 87, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(255, 71, 87, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 71, 87, 0); } }
 
@@ -233,11 +236,14 @@ function getConversationHTML(nonce) {
         .voice-fallback input { flex: 1; padding: 8px 12px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; color: #fff; font-size: 12px; font-family: inherit; }
         .voice-fallback input:focus { outline: 1px solid #00ff88; border-color: #00ff88; }
         .voice-fallback button { padding: 8px 14px; background: linear-gradient(135deg, #00ff88, #00c8ff); border: none; border-radius: 8px; color: #000; font-size: 11px; font-weight: 700; cursor: pointer; }
+        .voice-fallback button { padding: 8px 14px; background: linear-gradient(135deg, #00ff88, #00c8ff); border: none; border-radius: 8px; color: #000; font-size: 11px; font-weight: 700; cursor: pointer; }
     </style>
+    ${vadPaths ? `<script nonce="${nonce}" src="${vadPaths.bundlePath}"></script>` : ''}
 </head>
 <body>
     <div class="header">
         <span class="header-title">Verno</span>
+        <span id="coverageBadge" style="margin-right: 15px; font-size: 10px; font-weight: 700; padding: 3px 6px; border-radius: 4px; background: rgba(76, 175, 80, 0.2); color: #4caf50; display: none;">Coverage: --%</span>
         <button class="hdr-btn" id="newTaskBtn" title="New Task"><svg viewBox="0 0 16 16"><path d="M14 7v1H8v6H7V8H1V7h6V1h1v6h6z"/></svg></button>
         <button class="hdr-btn" id="historyBtn" title="History"><svg viewBox="0 0 16 16"><path d="M13.5 2h-11A1.5 1.5 0 001 3.5v9A1.5 1.5 0 002.5 14h11a1.5 1.5 0 001.5-1.5v-9A1.5 1.5 0 0013.5 2zM3 5h10v1H3V5zm0 3h10v1H3V8zm0 3h6v1H3v-1z"/></svg></button>
         <button class="hdr-btn" id="profileBtn" title="Profile"><svg viewBox="0 0 16 16"><path d="M8 1a3 3 0 100 6 3 3 0 000-6zM8 8c-3.3 0-6 1.8-6 4v1.5c0 .3.2.5.5.5h11c.3 0 .5-.2.5-.5V12c0-2.2-2.7-4-6-4z"/></svg></button>
@@ -406,7 +412,10 @@ function getConversationHTML(nonce) {
                 <select id="modeSelect" class="tsel" style="min-width:60px;font-weight:600;"><option value="plan">Plan</option><option value="code">Code</option><option value="ask">Ask</option></select>
                 <select id="modelSelect" class="tsel" style="min-width:90px;"><option value="gemini">Gemini Pro</option><option value="groq">Groq</option></select>
             </div>
-            <div class="right-ctrl"><button class="send-btn" id="sendBtn">Send</button></div>
+            <div class="right-ctrl">
+                <button class="sdlc-btn" id="sdlcBtn" title="Start SDLC Flow (PRD & Jira)">Start SDLC</button>
+                <button class="send-btn" id="sendBtn">Send</button>
+            </div>
         </div>
         <div id="apiKeyPrompt" class="api-key-prompt"><div>API Key required for <span id="modelNameDisp">Gemini</span>:</div><input type="password" id="apiKeyInp" placeholder="Enter API Key and press Enter..." /></div>
     </div>
@@ -414,6 +423,7 @@ function getConversationHTML(nonce) {
     <script nonce="${nonce}">
     (function(){
         var vscode = acquireVsCodeApi();
+        var vadPaths = ${vadPaths ? JSON.stringify(vadPaths) : 'null'};
         var saved = vscode.getState();
         var S = { mode:'plan', model:'gemini', providers:[], starred:[], mcpInstalled:[], settings:{}, customModes:[], workflows:[], rules:[], mcpGlobal:[], mcpWorkspace:[] };
         if(saved){
@@ -459,6 +469,7 @@ function getConversationHTML(nonce) {
         var overlayBg=document.getElementById('overlayBg');
         var panels={history:document.getElementById('historyPanel'),profile:document.getElementById('profilePanel'),mcp:document.getElementById('mcpPanel'),settings:document.getElementById('settingsPanel')};
         var btns={newTask:document.getElementById('newTaskBtn'),history:document.getElementById('historyBtn'),profile:document.getElementById('profileBtn'),mcp:document.getElementById('mcpBtn'),settings:document.getElementById('settingsBtn')};
+        var sdlcBtn=document.getElementById('sdlcBtn');
 
         // Init
         if(modeSelect) modeSelect.value=S.mode;
@@ -773,6 +784,11 @@ function getConversationHTML(nonce) {
 
         // === SEND ===
         if(sendBtn) sendBtn.addEventListener('click',function(){sendMessage();});
+        if(sdlcBtn) sdlcBtn.addEventListener('click',function(){
+            var text = msgInput ? msgInput.value.trim() : '';
+            vscode.postMessage({type:'start-sdlc', input: text});
+            if(msgInput) { msgInput.value=''; msgInput.style.height='auto'; }
+        });
         if(msgInput) msgInput.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage();}});
         function sendMessage(){
             if(!msgInput)return;
@@ -795,6 +811,23 @@ function getConversationHTML(nonce) {
         window.addEventListener('message',function(ev){
             var m=ev.data; if(!m||!m.type)return;
             switch(m.type){
+                case 'coverageUpdate':
+                    var badge = document.getElementById('coverageBadge');
+                    if (badge) {
+                        badge.style.display = 'inline-block';
+                        badge.textContent = 'Coverage: ' + m.percentage.toFixed(1) + '%';
+                        if (m.percentage >= 80) {
+                            badge.style.background = 'rgba(76, 175, 80, 0.2)';
+                            badge.style.color = '#4caf50';
+                        } else if (m.percentage >= 50) {
+                            badge.style.background = 'rgba(255, 193, 7, 0.2)';
+                            badge.style.color = '#ffc107';
+                        } else {
+                            badge.style.background = 'rgba(244, 67, 54, 0.2)';
+                            badge.style.color = '#f44336';
+                        }
+                    }
+                    break;
                 case 'newMessage': if(m.message)addMsg(m.message.role,m.message.content); if(thinking)thinking.style.display='none'; setTimeout(function(){if(ctxBar)ctxBar.classList.remove('show');},2000); break;
                 case 'thinking': if(thinking)thinking.style.display=m.show?'block':'none'; break;
                 case 'contextUsage': if(ctxBar&&ctxFill&&ctxStats){ctxBar.classList.add('show');var pct=Math.min((m.used/m.total)*100,100);ctxFill.style.width=pct+'%';var fk=function(n){return n>=1000?(n/1000).toFixed(1)+'k':''+n;};ctxStats.textContent=fk(m.used)+'/'+fk(m.total);} break;
@@ -828,11 +861,13 @@ function getConversationHTML(nonce) {
             var transcript = [];
             var isListening = false;
             var isSpeaking = false;
+            var isProcessing = false;
             var ttsSupported = false;
             var bestVoice = null;
             var waveBars = [];
             var speakTimer = null;
             var silenceTimer = null;
+            var safetyTimeout = null;
             // "Silence" timeout: Since we can't do real VAD in webview easily, 
             // we auto-stop after 15s of recording to prevent indefinite hanging.
             var MAX_RECORD_DURATION = 15000; 
@@ -914,17 +949,73 @@ function log(msg) {
 // --- RECORDING CONTROL ---
 
 var recordingTimeout = null;
+var myvad = null;
+
+async function initVAD() {
+    if (myvad || !window.vad) return;
+    try {
+        log('Initializing WebAssembly VAD...');
+        myvad = await window.vad.MicVAD.new({
+            workletURL: vadPaths ? vadPaths.workletPath : '',
+            modelURL: vadPaths ? vadPaths.modelPath : '',
+            ortConfig: {
+                wasmPaths: {
+                    "ort-wasm.wasm": vadPaths ? vadPaths.wasmRoot + 'ort-wasm.wasm' : '',
+                    "ort-wasm-simd.wasm": vadPaths ? vadPaths.wasmRoot + 'ort-wasm-simd.wasm' : '',
+                    "ort-wasm-threaded.wasm": vadPaths ? vadPaths.wasmRoot + 'ort-wasm-threaded.wasm' : '',
+                    "ort-wasm-simd-threaded.wasm": vadPaths ? vadPaths.wasmRoot + 'ort-wasm-simd-threaded.wasm' : ''
+                }
+            },
+            onSpeechStart: function() {
+                log('Speech started.');
+                setStatus('listening', 'Hearing you...');
+                setWaveActive(true);
+            },
+            onSpeechEnd: function(audio) {
+                log('Speech ended. Processing Int16 PCM...');
+                setWaveActive(false);
+                setStatus('thinking', 'Processing...');
+                
+                var int16Array = new Int16Array(audio.length);
+                for (var i = 0; i < audio.length; i++) {
+                    var s = Math.max(-1, Math.min(1, audio[i]));
+                    int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                
+                vscode.postMessage({ type: 'vadAudioData', audioData: Array.from(int16Array) });
+                stopListening();
+            },
+            onVADMisfire: function() {
+                log('VAD misfire (too short).');
+            }
+        });
+        log('VAD initialized successfully.');
+    } catch (e) {
+        log('VAD Init Error: ' + e);
+    }
+}
 
 function startListening() {
-    if (isSpeaking || isListening) return;
-
-    vscode.postMessage({ type: 'startRecording' });
+    if (isSpeaking || isListening || isProcessing) return;
 
     isListening = true;
     log('Starting native recording...');
-    setStatus('listening', 'Listening...');
-    setWaveActive(true);
+    setStatus('listening', 'Initializing Mic...');
     updateRecordBtn(true);
+
+    if (!myvad) {
+        initVAD().then(function() {
+            if (isListening && myvad) {
+                myvad.start();
+                setStatus('listening', 'Listening...');
+                setWaveActive(true);
+            }
+        });
+    } else {
+        myvad.start();
+        setStatus('listening', 'Listening...');
+        setWaveActive(true);
+    }
 
     // Auto-stop after MAX_RECORD_DURATION
     if (recordingTimeout) clearTimeout(recordingTimeout);
@@ -939,8 +1030,9 @@ function startListening() {
 function stopListening() {
     if (isListening) {
         log('Stopping native recording...');
-        vscode.postMessage({ type: 'stopRecording' });
         isListening = false;
+        
+        if (myvad) myvad.pause();
 
         if (recordingTimeout) { clearTimeout(recordingTimeout); recordingTimeout = null; }
 
@@ -967,12 +1059,24 @@ function setWaveActive(active) {
 function updateRecordBtn(recording) {
     var btn = document.getElementById('voiceRecordBtn');
     if (!btn) return;
-    if (recording) {
-        btn.innerHTML = '<span class="btn-icon">■</span> <span class="btn-text">Stop Recording</span>';
-        btn.className = 'voice-record-btn recording';
+    
+    if (isProcessing) {
+        btn.innerHTML = '<span class="btn-icon">⌛</span> <span class="btn-text">Thinking...</span>';
+        btn.className = 'voice-record-btn processing';
+        btn.style.opacity = '0.7';
+        btn.disabled = true;
+        btn.style.cursor = 'not-allowed';
     } else {
-        btn.innerHTML = '<span class="btn-icon">●</span> <span class="btn-text">Start Recording</span>';
-        btn.className = 'voice-record-btn';
+        btn.disabled = false;
+        btn.style.opacity = '1';
+        btn.style.cursor = 'pointer';
+        if (recording) {
+            btn.innerHTML = '<span class="btn-icon">■</span> <span class="btn-text">Stop Recording</span>';
+            btn.className = 'voice-record-btn recording';
+        } else {
+            btn.innerHTML = '<span class="btn-icon">●</span> <span class="btn-text">Start Recording</span>';
+            btn.className = 'voice-record-btn';
+        }
     }
 }
 
@@ -1014,6 +1118,10 @@ window.handleVoiceTranscript = function (text) {
         return;
     }
 
+    // Lock UI while text is being processed by the backend agent
+    isProcessing = true;
+    updateRecordBtn(false);
+
     // Add to transcript
     transcript.push({ role: 'user', text: text });
     addTranscriptTurn('user', text);
@@ -1021,9 +1129,37 @@ window.handleVoiceTranscript = function (text) {
     // Send to Agent
     setStatus('thinking', 'Agent is thinking...');
     submitToAgent(text);
+
+    // Safety valve — unlock after 30 seconds no matter what
+    if (safetyTimeout) clearTimeout(safetyTimeout);
+    safetyTimeout = setTimeout(() => {
+        if (isProcessing) {
+            isProcessing = false;
+            updateRecordBtn(isListening);
+            console.warn('[VoiceChatEngine] Mutex force-released after timeout');
+            setStatus('ready', 'Click Record to speak');
+        }
+    }, 30000);
+}
+
+window.handleThinkingState = function(isThinking) {
+    if (isProcessing !== isThinking) {
+        isProcessing = isThinking;
+        if (!isThinking) {
+            if (safetyTimeout) {
+                clearTimeout(safetyTimeout);
+                safetyTimeout = null;
+            }
+            if (!isListening && !isSpeaking) {
+                setStatus('ready', 'Click Record to speak');
+            }
+        }
+        updateRecordBtn(isListening);
+    }
 }
 
 window.handleVoiceError = function (msg) {
+    isProcessing = false;
     setStatus('thinking', 'Error: ' + msg);
     updateRecordBtn(false);
     if (recordingTimeout) clearTimeout(recordingTimeout);
@@ -1104,6 +1240,9 @@ window.addEventListener('message', event => {
     // Hook into newMessage for TTS
     else if (m.type === 'newMessage' && m.message) {
         window.handleNewMessage(m.message.role, m.message.content);
+    }
+    else if (m.type === 'thinking') {
+        if (window.handleThinkingState) window.handleThinkingState(m.show);
     }
     else if (m.type === 'restoreVoiceSession') {
         // Restore UI without greeting

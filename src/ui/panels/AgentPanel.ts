@@ -3,6 +3,8 @@
  */
 
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 
 export interface ConversationMessage {
   role: 'user' | 'assistant' | 'system';
@@ -13,8 +15,34 @@ export interface ConversationMessage {
 export class AgentPanel {
   private webviewView?: vscode.WebviewView;
   private conversationHistory: ConversationMessage[] = [];
+  private coverageInterval?: any;
+  private lastCoveragePct: number = -1;
 
-  constructor(private context: vscode.ExtensionContext) { }
+  constructor(private context: vscode.ExtensionContext) { 
+    this.startCoveragePolling();
+  }
+
+  private startCoveragePolling() {
+    this.coverageInterval = setInterval(() => this.checkCoverage(), 5000);
+  }
+
+  private checkCoverage() {
+    try {
+      const wsPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!wsPath) return;
+      const summaryPath = path.join(wsPath, 'coverage', 'coverage-summary.json');
+      if (fs.existsSync(summaryPath)) {
+        const data = JSON.parse(fs.readFileSync(summaryPath, 'utf-8'));
+        const pct = data?.total?.lines?.pct || (data?.total?.statements?.pct);
+        if (typeof pct === 'number' && pct !== this.lastCoveragePct) {
+          this.lastCoveragePct = pct;
+          this.updateCoverage(pct);
+        }
+      }
+    } catch (e) {
+      // quiet fail
+    }
+  }
 
   /**
    * Set the webview view from the sidebar provider
@@ -127,6 +155,16 @@ export class AgentPanel {
       type: 'contextUsage',
       used,
       total
+    });
+  }
+
+  /**
+   * Send coverage update to the sidebar badge
+   */
+  updateCoverage(percentage: number) {
+    this.postMessage({
+      type: 'coverageUpdate',
+      percentage
     });
   }
 }

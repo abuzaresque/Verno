@@ -47,6 +47,7 @@ exports.CODING_PHASE_AGENTS = new Set([
     'codereview',
     'qa',
     'techwriter',
+    'testGenerator',
 ]);
 /**
  * Service for managing plan state persistence between PLAN and CODE phases

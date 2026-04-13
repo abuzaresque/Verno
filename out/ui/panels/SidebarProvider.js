@@ -35,14 +35,17 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.SidebarProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const path = __importStar(require("path"));
 const conversationTemplate_1 = require("../templates/conversationTemplate");
 const WindowsVoiceRecorder_1 = require("../../services/voice/WindowsVoiceRecorder");
+const audioSanitizer_1 = require("../../services/audioSanitizer");
 class SidebarProvider {
     context;
     static viewType = 'verno.agentPanel';
     logger;
     llmService;
     windowsRecorder = null;
+    audioSanitizer;
     onResolve;
     sessionVoiceKey;
     isVoiceSessionActive = false;
@@ -50,6 +53,7 @@ class SidebarProvider {
         this.context = context;
         this.logger = logger;
         this.llmService = llmService;
+        this.audioSanitizer = new audioSanitizer_1.AudioSanitizer();
         this.onResolve = onResolve;
     }
     resolveWebviewView(webviewView, _context, _token) {
@@ -64,6 +68,9 @@ class SidebarProvider {
             switch (data.type) {
                 case 'processInputSubmit':
                     await vscode.commands.executeCommand('verno.processInputWithData', data.apiKey, data.input, data.mode, data.model);
+                    break;
+                case 'start-sdlc':
+                    await vscode.commands.executeCommand('verno.startSDLC', data.input);
                     break;
                 case 'newTask':
                     await vscode.commands.executeCommand('verno.newTask');
@@ -99,21 +106,39 @@ class SidebarProvider {
                         webviewView.webview.postMessage({ type: 'voiceError', message: 'Failed to start recording' });
                     }
                     break;
+                case 'vadAudioData':
+                    try {
+                        this.logger.info('[Sidebar] Received VAD Int16Array data from Webview');
+                        const samples = data.audioData;
+                        if (!samples || samples.length < 8000) {
+                            this.logger.warn('[Sidebar] VAD audio too short (less than 0.5s). Aborting.');
+                            vscode.window.showWarningMessage('Recording was too short.');
+                            webviewView.webview.postMessage({ type: 'voiceError', message: 'Recording too short' });
+                            return;
+                        }
+                        const wavBuffer = this.encodeWav(samples, 16000);
+                        const base64Audio = wavBuffer.toString('base64');
+                        await this.processAudioBase64(base64Audio, webviewView);
+                    }
+                    catch (error) {
+                        this.logger.error('[Sidebar] Failed to process VAD audio', error);
+                        vscode.window.showErrorMessage('VAD processing failed: ' + error.message);
+                        webviewView.webview.postMessage({ type: 'voiceError', message: 'Processing failed' });
+                    }
+                    break;
                 case 'stopRecording':
                     try {
                         if (this.windowsRecorder) {
                             this.logger.info('[Sidebar] Stopping native recording...');
                             const filePath = await this.windowsRecorder.stop();
                             this.logger.info(`[Sidebar] Native recording saved to ${filePath}`);
-                            // Read file and transcribe
                             const fs = require('fs');
                             const stats = fs.statSync(filePath);
                             const fileSizeInBytes = stats.size;
                             this.logger.info(`[Sidebar] Recording file size: ${fileSizeInBytes} bytes`);
                             if (fileSizeInBytes < 1024) {
-                                // < 1KB is basically empty (44 byte header + silence)
-                                this.logger.warn('[Sidebar] Recording is too short/empty. Aborting transcription.');
-                                vscode.window.showWarningMessage('Recording was too short or captured no audio. Please try speaking longer.');
+                                this.logger.warn('[Sidebar] Recording is too short/empty.');
+                                vscode.window.showWarningMessage('Recording was too short or captured no audio.');
                                 webviewView.webview.postMessage({ type: 'voiceError', message: 'Recording too short' });
                                 try {
                                     fs.unlinkSync(filePath);
@@ -123,99 +148,11 @@ class SidebarProvider {
                             }
                             const fileBuffer = fs.readFileSync(filePath);
                             const base64Audio = fileBuffer.toString('base64');
-                            // Clean up file
                             try {
                                 fs.unlinkSync(filePath);
                             }
                             catch (e) { }
-                            // PREFER GROQ WHISPER IF AVAILABLE
-                            // Check for configured Groq Key first
-                            const config = vscode.workspace.getConfiguration('verno');
-                            let groqKey = (await this.context.secrets.get('groqApiKey')) || this.sessionVoiceKey;
-                            // If not in config, check .env in workspace root
-                            if (!groqKey && vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
-                                try {
-                                    const fs = require('fs');
-                                    const path = require('path');
-                                    const envPath = path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, '.env');
-                                    if (fs.existsSync(envPath)) {
-                                        const envContent = fs.readFileSync(envPath).toString();
-                                        const match = envContent.match(/^(?:VERNO_)?GROQ_API_KEY=(.*)$/m);
-                                        if (match && match[1]) {
-                                            groqKey = match[1].trim();
-                                            this.logger.info('[Sidebar] Found Groq API Key in .env file');
-                                            // Cache it for session
-                                            this.sessionVoiceKey = groqKey;
-                                        }
-                                    }
-                                }
-                                catch (envErr) {
-                                    this.logger.warn(`[Sidebar] Error reading .env file: ${envErr.message}`);
-                                }
-                            }
-                            this.logger.info(`[Sidebar] Voice Config - GroqKey configured: ${!!groqKey}`);
-                            let transcriptionProvider;
-                            if (groqKey) {
-                                // User has a Groq key, use it specifically for efficient Whisper
-                                const { GroqProvider } = require('../../services/llm/providers/GroqProvider');
-                                const groqProvider = new GroqProvider();
-                                await groqProvider.initialize(groqKey);
-                                transcriptionProvider = groqProvider;
-                                this.logger.info('[Sidebar] Using dedicated Groq Whisper for transcription (from Config/Cache)');
-                            }
-                            else {
-                                // Fallback to current provider (Gemini etc)
-                                transcriptionProvider = await this.getLLMProvider();
-                                this.logger.info(`[Sidebar] Voice Fallback - Active Provider available: ${!!transcriptionProvider}`);
-                            }
-                            // If still no provider (fresh start, no config), Prompt user!
-                            if (!transcriptionProvider) {
-                                this.logger.info('[Sidebar] No active provider or config. Prompting user for Voice Key...');
-                                const inputKey = await vscode.window.showInputBox({
-                                    prompt: 'Voice Transcription requires an API Key. Enter Groq API Key (recommended) or Gemini Key. It will be saved to your settings.',
-                                    ignoreFocusOut: true,
-                                    placeHolder: 'gsk_... (Groq) or AIza... (Gemini)'
-                                });
-                                if (inputKey) {
-                                    if (inputKey.startsWith('gsk_')) {
-                                        const { GroqProvider } = require('../../services/llm/providers/GroqProvider');
-                                        const groqProvider = new GroqProvider();
-                                        await groqProvider.initialize(inputKey);
-                                        transcriptionProvider = groqProvider;
-                                        // Cache and SAVE the key
-                                        this.sessionVoiceKey = inputKey;
-                                        await this.context.secrets.store('groqApiKey', inputKey);
-                                        this.logger.info('[Sidebar] Saved Groq key to SecretStorage');
-                                    }
-                                    else if (inputKey.startsWith('AIza')) {
-                                        const { GeminiProvider } = require('../../services/llm/providers/GeminiProvider');
-                                        const geminiProvider = new GeminiProvider();
-                                        await geminiProvider.initialize(inputKey);
-                                        transcriptionProvider = geminiProvider;
-                                        this.logger.info('[Sidebar] Using user-provided Gemini key');
-                                    }
-                                }
-                            }
-                            if (transcriptionProvider && transcriptionProvider.transcribeAudio) {
-                                this.logger.info('[Sidebar] Transcribing audio...');
-                                try {
-                                    const text = await transcriptionProvider.transcribeAudio(base64Audio);
-                                    this.logger.info(`[Sidebar] Transcription success: "${text.substring(0, 30)}..."`);
-                                    webviewView.webview.postMessage({ type: 'voiceTranscript', text });
-                                }
-                                catch (transcribeError) {
-                                    this.logger.error('[Sidebar] Transcription error', transcribeError);
-                                    vscode.window.showErrorMessage('Transcription failed: ' + transcribeError.message);
-                                    webviewView.webview.postMessage({ type: 'voiceError', message: 'Transcription failed' });
-                                }
-                            }
-                            else {
-                                const msg = transcriptionProvider
-                                    ? `Current provider (${transcriptionProvider.constructor.name}) does not support audio transcription`
-                                    : 'No API Key configured for Voice. Start a voice session to configure.';
-                                vscode.window.showWarningMessage(msg);
-                                webviewView.webview.postMessage({ type: 'voiceError', message: msg });
-                            }
+                            await this.processAudioBase64(base64Audio, webviewView);
                         }
                     }
                     catch (error) {
@@ -254,9 +191,121 @@ class SidebarProvider {
     async getLLMProvider() {
         return this.llmService.getProvider() || undefined;
     }
+    encodeWav(samples, sampleRate = 16000) {
+        const buffer = Buffer.alloc(44 + samples.length * 2);
+        // RIFF chunk descriptor
+        buffer.write('RIFF', 0);
+        buffer.writeUInt32LE(36 + samples.length * 2, 4);
+        buffer.write('WAVE', 8);
+        // fmt sub-chunk
+        buffer.write('fmt ', 12);
+        buffer.writeUInt32LE(16, 16); // Subchunk1Size
+        buffer.writeUInt16LE(1, 20); // AudioFormat
+        buffer.writeUInt16LE(1, 22); // NumChannels
+        buffer.writeUInt32LE(sampleRate, 24); // SampleRate
+        buffer.writeUInt32LE(sampleRate * 2, 28); // ByteRate
+        buffer.writeUInt16LE(2, 32); // BlockAlign
+        buffer.writeUInt16LE(16, 34); // BitsPerSample
+        // data sub-chunk
+        buffer.write('data', 36);
+        buffer.writeUInt32LE(samples.length * 2, 40);
+        let offset = 44;
+        for (let i = 0; i < samples.length; i++) {
+            buffer.writeInt16LE(samples[i], offset);
+            offset += 2;
+        }
+        return buffer;
+    }
+    async processAudioBase64(base64Audio, webviewView) {
+        // PREFER GROQ WHISPER IF AVAILABLE
+        let groqKey = (await this.context.secrets.get('groqApiKey')) || this.sessionVoiceKey;
+        if (!groqKey && vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
+            try {
+                const fs = require('fs');
+                const path = require('path');
+                const envPath = path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, '.env');
+                if (fs.existsSync(envPath)) {
+                    const envContent = fs.readFileSync(envPath).toString();
+                    const match = envContent.match(/^(?:VERNO_)?GROQ_API_KEY=(.*)$/m);
+                    if (match && match[1]) {
+                        groqKey = match[1].trim();
+                        this.logger.info('[Sidebar] Found Groq API Key in .env file');
+                        this.sessionVoiceKey = groqKey;
+                    }
+                }
+            }
+            catch (envErr) {
+                this.logger.warn(`[Sidebar] Error reading .env file: ${envErr.message}`);
+            }
+        }
+        let transcriptionProvider;
+        if (groqKey) {
+            const { GroqProvider } = require('../../services/llm/providers/GroqProvider');
+            const groqProvider = new GroqProvider();
+            await groqProvider.initialize(groqKey);
+            transcriptionProvider = groqProvider;
+        }
+        else {
+            transcriptionProvider = await this.getLLMProvider();
+        }
+        if (!transcriptionProvider) {
+            this.logger.info('[Sidebar] No active provider or config. Prompting user for Voice Key...');
+            const inputKey = await vscode.window.showInputBox({
+                prompt: 'Voice Transcription requires an API Key. Enter Groq API Key (recommended) or Gemini Key. It will be saved to your settings.',
+                ignoreFocusOut: true,
+                placeHolder: 'gsk_... (Groq) or AIza... (Gemini)'
+            });
+            if (inputKey) {
+                if (inputKey.startsWith('gsk_')) {
+                    const { GroqProvider } = require('../../services/llm/providers/GroqProvider');
+                    const groqProvider = new GroqProvider();
+                    await groqProvider.initialize(inputKey);
+                    transcriptionProvider = groqProvider;
+                    this.sessionVoiceKey = inputKey;
+                    await this.context.secrets.store('groqApiKey', inputKey);
+                }
+                else if (inputKey.startsWith('AIza')) {
+                    const { GeminiProvider } = require('../../services/llm/providers/GeminiProvider');
+                    const geminiProvider = new GeminiProvider();
+                    await geminiProvider.initialize(inputKey);
+                    transcriptionProvider = geminiProvider;
+                }
+            }
+        }
+        if (transcriptionProvider && transcriptionProvider.transcribeAudio) {
+            this.logger.info('[Sidebar] Transcribing audio...');
+            try {
+                const text = await transcriptionProvider.transcribeAudio(base64Audio);
+                this.logger.info(`[Sidebar] Transcription (raw): "${text.substring(0, 60)}..."`);
+                const sanitizedText = await this.audioSanitizer.sanitize(text);
+                if (sanitizedText !== text) {
+                    this.logger.info(`[Sidebar] Transcription (sanitized): "${sanitizedText.substring(0, 60)}..."`);
+                }
+                webviewView.webview.postMessage({ type: 'voiceTranscript', text: sanitizedText });
+            }
+            catch (transcribeError) {
+                this.logger.error('[Sidebar] Transcription error', transcribeError);
+                vscode.window.showErrorMessage('Transcription failed: ' + transcribeError.message);
+                webviewView.webview.postMessage({ type: 'voiceError', message: 'Transcription failed' });
+            }
+        }
+        else {
+            const msg = transcriptionProvider
+                ? `Current provider (${transcriptionProvider.constructor.name}) does not support audio transcription`
+                : 'No API Key configured for Voice.';
+            vscode.window.showWarningMessage(msg);
+            webviewView.webview.postMessage({ type: 'voiceError', message: msg });
+        }
+    }
     getHtmlForWebview(webview) {
         const nonce = getNonce();
-        return (0, conversationTemplate_1.getConversationHTML)(nonce);
+        const vadPaths = {
+            bundlePath: webview.asWebviewUri(vscode.Uri.file(path.join(this.context.extensionPath, 'media', 'vad', 'vad.bundle.min.js'))).toString(),
+            workletPath: webview.asWebviewUri(vscode.Uri.file(path.join(this.context.extensionPath, 'media', 'vad', 'vad.worklet.bundle.min.js'))).toString(),
+            modelPath: webview.asWebviewUri(vscode.Uri.file(path.join(this.context.extensionPath, 'media', 'vad', 'silero_vad.onnx'))).toString(),
+            wasmRoot: webview.asWebviewUri(vscode.Uri.file(path.join(this.context.extensionPath, 'media', 'vad'))).toString() + '/'
+        };
+        return (0, conversationTemplate_1.getConversationHTML)(nonce, vadPaths);
     }
 }
 exports.SidebarProvider = SidebarProvider;

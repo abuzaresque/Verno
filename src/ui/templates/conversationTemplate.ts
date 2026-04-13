@@ -159,7 +159,9 @@ export function getConversationHTML(nonce: string, vadPaths?: VadPaths): string 
         .tsel:focus { border-color: var(--focus); }
         .right-ctrl { display: flex; gap: 5px; align-items: center; }
         .send-btn { height: 24px; padding: 0 12px; background: var(--btn-bg); color: var(--btn-fg); border: none; border-radius: 3px; font-size: 10px; font-weight: 700; cursor: pointer; }
+        .sdlc-btn { height: 24px; padding: 0 12px; background: #9b59b6; color: white; border: none; border-radius: 3px; font-size: 10px; font-weight: 700; cursor: pointer; }
         .send-btn:hover { background: var(--btn-hover); }
+        .sdlc-btn:hover { filter: brightness(1.1); }
         .api-key-prompt { display: none; margin-top: 6px; padding: 6px 8px; background: var(--quote-bg); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; }
         .api-key-prompt input { margin-top: 3px; width: 100%; padding: 4px; background: var(--input-bg); border: 1px solid var(--border); color: var(--input-fg); font-size: 11px; }
 
@@ -246,6 +248,7 @@ export function getConversationHTML(nonce: string, vadPaths?: VadPaths): string 
 <body>
     <div class="header">
         <span class="header-title">Verno</span>
+        <span id="coverageBadge" style="margin-right: 15px; font-size: 10px; font-weight: 700; padding: 3px 6px; border-radius: 4px; background: rgba(76, 175, 80, 0.2); color: #4caf50; display: none;">Coverage: --%</span>
         <button class="hdr-btn" id="newTaskBtn" title="New Task"><svg viewBox="0 0 16 16"><path d="M14 7v1H8v6H7V8H1V7h6V1h1v6h6z"/></svg></button>
         <button class="hdr-btn" id="historyBtn" title="History"><svg viewBox="0 0 16 16"><path d="M13.5 2h-11A1.5 1.5 0 001 3.5v9A1.5 1.5 0 002.5 14h11a1.5 1.5 0 001.5-1.5v-9A1.5 1.5 0 0013.5 2zM3 5h10v1H3V5zm0 3h10v1H3V8zm0 3h6v1H3v-1z"/></svg></button>
         <button class="hdr-btn" id="profileBtn" title="Profile"><svg viewBox="0 0 16 16"><path d="M8 1a3 3 0 100 6 3 3 0 000-6zM8 8c-3.3 0-6 1.8-6 4v1.5c0 .3.2.5.5.5h11c.3 0 .5-.2.5-.5V12c0-2.2-2.7-4-6-4z"/></svg></button>
@@ -414,7 +417,10 @@ export function getConversationHTML(nonce: string, vadPaths?: VadPaths): string 
                 <select id="modeSelect" class="tsel" style="min-width:60px;font-weight:600;"><option value="plan">Plan</option><option value="code">Code</option><option value="ask">Ask</option></select>
                 <select id="modelSelect" class="tsel" style="min-width:90px;"><option value="gemini">Gemini Pro</option><option value="groq">Groq</option></select>
             </div>
-            <div class="right-ctrl"><button class="send-btn" id="sendBtn">Send</button></div>
+            <div class="right-ctrl">
+                <button class="sdlc-btn" id="sdlcBtn" title="Start SDLC Flow (PRD & Jira)">Start SDLC</button>
+                <button class="send-btn" id="sendBtn">Send</button>
+            </div>
         </div>
         <div id="apiKeyPrompt" class="api-key-prompt"><div>API Key required for <span id="modelNameDisp">Gemini</span>:</div><input type="password" id="apiKeyInp" placeholder="Enter API Key and press Enter..." /></div>
     </div>
@@ -468,6 +474,7 @@ export function getConversationHTML(nonce: string, vadPaths?: VadPaths): string 
         var overlayBg=document.getElementById('overlayBg');
         var panels={history:document.getElementById('historyPanel'),profile:document.getElementById('profilePanel'),mcp:document.getElementById('mcpPanel'),settings:document.getElementById('settingsPanel')};
         var btns={newTask:document.getElementById('newTaskBtn'),history:document.getElementById('historyBtn'),profile:document.getElementById('profileBtn'),mcp:document.getElementById('mcpBtn'),settings:document.getElementById('settingsBtn')};
+        var sdlcBtn=document.getElementById('sdlcBtn');
 
         // Init
         if(modeSelect) modeSelect.value=S.mode;
@@ -782,6 +789,11 @@ export function getConversationHTML(nonce: string, vadPaths?: VadPaths): string 
 
         // === SEND ===
         if(sendBtn) sendBtn.addEventListener('click',function(){sendMessage();});
+        if(sdlcBtn) sdlcBtn.addEventListener('click',function(){
+            var text = msgInput ? msgInput.value.trim() : '';
+            vscode.postMessage({type:'start-sdlc', input: text});
+            if(msgInput) { msgInput.value=''; msgInput.style.height='auto'; }
+        });
         if(msgInput) msgInput.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage();}});
         function sendMessage(){
             if(!msgInput)return;
@@ -804,6 +816,23 @@ export function getConversationHTML(nonce: string, vadPaths?: VadPaths): string 
         window.addEventListener('message',function(ev){
             var m=ev.data; if(!m||!m.type)return;
             switch(m.type){
+                case 'coverageUpdate':
+                    var badge = document.getElementById('coverageBadge');
+                    if (badge) {
+                        badge.style.display = 'inline-block';
+                        badge.textContent = 'Coverage: ' + m.percentage.toFixed(1) + '%';
+                        if (m.percentage >= 80) {
+                            badge.style.background = 'rgba(76, 175, 80, 0.2)';
+                            badge.style.color = '#4caf50';
+                        } else if (m.percentage >= 50) {
+                            badge.style.background = 'rgba(255, 193, 7, 0.2)';
+                            badge.style.color = '#ffc107';
+                        } else {
+                            badge.style.background = 'rgba(244, 67, 54, 0.2)';
+                            badge.style.color = '#f44336';
+                        }
+                    }
+                    break;
                 case 'newMessage': if(m.message)addMsg(m.message.role,m.message.content); if(thinking)thinking.style.display='none'; setTimeout(function(){if(ctxBar)ctxBar.classList.remove('show');},2000); break;
                 case 'thinking': if(thinking)thinking.style.display=m.show?'block':'none'; break;
                 case 'contextUsage': if(ctxBar&&ctxFill&&ctxStats){ctxBar.classList.add('show');var pct=Math.min((m.used/m.total)*100,100);ctxFill.style.width=pct+'%';var fk=function(n){return n>=1000?(n/1000).toFixed(1)+'k':''+n;};ctxStats.textContent=fk(m.used)+'/'+fk(m.total);} break;

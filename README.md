@@ -10,6 +10,12 @@ Verno is an advanced VSCode extension that brings intelligent multi-agent AI cap
 - **Orchestrator**: Automatic workflow coordination and task distribution
 - **Context-Aware**: Smart detection of new vs existing projects
 
+### SDLC Automation & Jira Integration 🏗️
+- **AI Persona Debate**: 4 distinct AI agents (PM, Architect, Frontend, QA) debate your feature request over 3 rounds.
+- **Auto-PRD Generation**: Synthesizes the debate into a structured Product Requirements Document (PRD).
+- **Jira Sync Engine**: Decomposes the approved PRD into Epics, Stories, and Subtasks, automatically pushing them to your connected Atlassian Jira project.
+- **Resilient Webviews**: Rich, persistent UI panels for SDLC wizardry and Jira setup, featuring dry-run capabilities and crash-safe state recovery.
+
 ### Automatic Code Quality Validation ✨
 The **DeveloperAgent** now includes a comprehensive 4-step quality pipeline that runs automatically after code generation:
 
@@ -76,6 +82,10 @@ workspace/
     ├── conversations/          # Conversation history
     ├── todos/                  # TODO lists by agent
     ├── feedback/               # Agent feedback reports
+    ├── PRD.md                 # Product Requirements Document (SDLC phase)
+    ├── tasks.md               # Generated Epics and Stories
+    ├── sdlc-state.json        # SDLC session state recovery
+    ├── jira-config.json       # Jira project configuration
     ├── PROJECT_PLAN.md        # Planning output
     ├── ANALYSIS.md            # Business analysis
     ├── ARCHITECTURE.md        # System architecture
@@ -97,11 +107,17 @@ workspace/
 
 ### Example Workflow
 
-1. **Planning**: "Create a plan for a task management app"
+1. **SDLC Phase (Ideation & Tasks)**: "Build a new e-commerce app"
+   - SDLC Webview intercepts project requests.
+   - DebateOrchestrator runs 3-round AI debate and generates `PRD.md`.
+   - User approves PRD and tasks are decomposed into Jira Epics & Stories.
+   - Tasks are synced to Jira.
+
+2. **Planning**: Orchestrator kicks in with the approved PRD
    - PlanningAgent generates comprehensive project plan
    - Orchestrator creates TODO list with dependencies
    
-2. **Development**: Orchestrator executes BMAD pipeline
+3. **Development**: Orchestrator executes BMAD pipeline
    - AnalystAgent performs business analysis
    - ArchitectAgent designs system architecture
    - UXDesignerAgent creates UX specifications

@@ -9,6 +9,39 @@
  * Plan state is persisted in .verno/plan-state/plan.json between invocations.
  * Old plans are backed up with timestamps in .verno/plan-state/history/.
  */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.OrchestratorAgent = void 0;
 const BaseAgent_1 = require("../base/BaseAgent");
@@ -30,6 +63,8 @@ const todo_1 = require("../../services/todo");
 const project_1 = require("../../services/project");
 const feedback_1 = require("../../services/feedback");
 const PlanStateService_1 = require("../../services/planning/PlanStateService");
+const ContextBuilder_1 = require("../../services/workflow/ContextBuilder");
+const vscode = __importStar(require("vscode"));
 /** Available agents the planner can assign */
 const AVAILABLE_AGENTS = {
     analyst: 'Business Analyst (Mary) - Requirements analysis, market research',
@@ -94,6 +129,37 @@ class OrchestratorAgent extends BaseAgent_1.BaseAgent {
         this.agentRegistry.register('techwriter', new TechWriterAgent_1.TechWriterAgent(this.logger, this.llmService, this.fileService, this.changeTracker));
         this.agentRegistry.register('quickflowdev', new QuickFlowSoloDevAgent_1.QuickFlowSoloDevAgent(this.logger, this.llmService, this.fileService, this.changeTracker));
         this.agentRegistry.register('codereview', new CodeReviewAgent_1.CodeReviewAgent(this.logger, this.llmService, this.fileService, this.changeTracker));
+    }
+    // ==========================================
+    // SDLC INTERCEPT AND INJECTION
+    // ==========================================
+    async startSDLCFlow(topic) {
+        await vscode.commands.executeCommand('verno.startSDLC', topic);
+    }
+    async onPRDApproved(prd, context) {
+        this.log('PRD Approved. Triggering BMAD execution pipeline.');
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceRoot) {
+            vscode.window.showErrorMessage('No workspace folder open');
+            return;
+        }
+        const prdString = JSON.stringify(prd, null, 2);
+        // Inject PRD into agent context
+        const agentContext = new ContextBuilder_1.ContextBuilder()
+            .setWorkspaceRoot(workspaceRoot)
+            .setMetadata({
+            userRequest: `[APPROVED PRD ATTACHED]\n\nPlease implement the features described in this PRD:\n\n${prdString}`,
+            mode: 'plan',
+            timestamp: new Date().toISOString()
+        })
+            .build();
+        try {
+            await this.executePlan(agentContext);
+            vscode.window.showInformationMessage('BMAD Planning phase completed based on PRD!');
+        }
+        catch (err) {
+            vscode.window.showErrorMessage(`BMAD Pipeline failed: ${err.message}`);
+        }
     }
     // ==========================================
     // BACKWARD-COMPATIBLE EXECUTE (runs both)
@@ -360,6 +426,33 @@ class OrchestratorAgent extends BaseAgent_1.BaseAgent {
                 if (reviewStep) {
                     await this.runCodeReviewWithRetry(context, agentOutputs, results, conversationHistory, projectContext);
                     // Remove codereview from the loop's remaining steps
+                }
+                // Auto-generate unit tests after code generation
+                try {
+                    this.log('Auto-generating unit tests for generated code...');
+                    const testGenAgent = this.agentRegistry.get('testGenerator');
+                    if (testGenAgent) {
+                        results.push(`\n## 🧪 Generating Unit Tests...`);
+                        const testContext = {
+                            ...context,
+                            metadata: {
+                                ...context.metadata,
+                                codeAnalysis: agentOutputs['developer'],
+                            }
+                        };
+                        const testResult = await testGenAgent.execute(testContext);
+                        agentOutputs['testGenerator'] = testResult;
+                        results.push(`\n${testResult}`);
+                        if (this.planStateService) {
+                            this.planStateService.markStepComplete('testGenerator', testResult);
+                        }
+                        this.log('TestGeneratorAgent completed successfully');
+                    }
+                }
+                catch (testErr) {
+                    const errMsg = testErr instanceof Error ? testErr.message : String(testErr);
+                    this.log(`TestGeneratorAgent failed: ${errMsg}`, 'error');
+                    results.push(`\n## ⚠️ Unit Test Generation Skipped\n${errMsg}`);
                 }
             }
         }
