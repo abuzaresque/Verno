@@ -24,6 +24,7 @@ import { setLocalWhisperInstance, setGroqProviderInstance } from './services/aud
 import { AudioSanitizer } from './services/audioSanitizer';
 import { SDLCWebviewPanel } from './panels/SDLCWebviewPanel';
 import { PRDDocument } from './types/sdlc';
+import { WorkspaceIntelligence } from './services/workspace/WorkspaceIntelligence';
 
 let logger: Logger;
 let configService: ConfigService;
@@ -76,7 +77,9 @@ export async function activate(context: vscode.ExtensionContext) {
 		llmService = new LLMService();
 		recordingStatus = new RecordingStatus();
 		agentPanel = new AgentPanel(context);
-		brain = new ConversationEngine();
+		// SDLC-aware conversation engine
+		const wsIntel = new WorkspaceIntelligence(configService);
+		brain = new ConversationEngine(wsIntel, configService, logger);
 		tts = new TTSService();
 		localWhisper = new LocalWhisperService();
 		audioSanitizer = new AudioSanitizer();

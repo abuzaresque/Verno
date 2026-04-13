@@ -41,6 +41,7 @@ export const CODING_PHASE_AGENTS = new Set([
     'codereview',
     'qa',
     'techwriter',
+    'testGenerator',
 ]);
 
 /**
@@ -202,6 +203,20 @@ export class PlanStateService {
                 path: path.join(this.backupDir, f),
                 timestamp: f.replace('plan-', '').replace('.json', ''),
             }));
+    }
+
+    /**
+     * Get a human-readable label describing the current pipeline state.
+     * Used by WorkspaceIntelligence to inject SDLC phase into the system prompt.
+     */
+    getCurrentPhaseLabel(): string | null {
+        const state = this.loadPlanState();
+        if (!state) { return null; }
+        const pending = state.pendingSteps;
+        const completed = state.completedSteps;
+        if (pending.length === 0) { return 'Pipeline complete'; }
+        const nextAgent = pending[0];
+        return `${nextAgent} pending (${completed.length}/${state.plan.steps.length} steps done)`;
     }
 
     /**
