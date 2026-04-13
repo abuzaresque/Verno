@@ -52,7 +52,7 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 02-01: SDLC-Aware ConversationEngine — workspace-context system prompt, mode detection
+- [x] 02-01: SDLC-Aware ConversationEngine — workspace-context system prompt, mode detection
 - [ ] 02-02: Mode Toggle UI — sidebar toggle, context-aware response templates
 
 ### Phase 3: PRD Hardening (SDLC Phase 1)
