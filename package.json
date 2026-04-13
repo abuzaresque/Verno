@@ -1,9 +1,9 @@
 {
   "name": "verno",
-  "displayName": "verno",
-  "description": "a voice agentic coding agent",
-  "version": "0.0.1",
-  "publisher": "yourname",
+  "displayName": "Verno — AI SDLC Automation Engine",
+  "description": "Voice-first multi-agent AI assistant that automates the full Software Development Life Cycle inside VSCode.",
+  "version": "0.2.0",
+  "publisher": "verno-ai",
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -49,6 +49,14 @@
       {
         "command": "verno.processVoiceInput",
         "title": "Verno: Process Voice Input"
+      },
+      {
+        "command": "verno.clearApiKeys",
+        "title": "Verno: Clear Stored API Keys"
+      },
+      {
+        "command": "verno.startSDLC",
+        "title": "Verno: Start SDLC Pipeline"
       }
     ],
     "viewsContainers": {
@@ -84,15 +92,11 @@
     "configuration": {
       "title": "Verno",
       "properties": {
-        "verno.anthropicApiKey": {
+        "verno.defaultProvider": {
           "type": "string",
-          "default": "",
-          "description": "Anthropic API key for Claude (best coding model)"
-        },
-        "verno.groqApiKey": {
-          "type": "string",
-          "default": "",
-          "description": "Groq API key for LLaMA fallback and cloud STT"
+          "default": "gemini",
+          "enum": ["gemini", "groq", "anthropic", "openai"],
+          "description": "Default AI provider. API keys are stored securely via Verno: Clear Stored API Keys."
         },
         "verno.ttsEnabled": {
           "type": "boolean",
@@ -140,9 +144,11 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "vscode-test",
+    "test:e2e": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "@types/mocha": "^10.0.10",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.80.0",

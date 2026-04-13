@@ -22,6 +22,8 @@ import { TTSService } from './services/ttsService';
 import { LocalWhisperService } from './services/localWhisperService';
 import { setLocalWhisperInstance, setGroqProviderInstance } from './services/audioRouter';
 import { AudioSanitizer } from './services/audioSanitizer';
+import { SDLCWebviewPanel } from './panels/SDLCWebviewPanel';
+import { PRDDocument } from './types/sdlc';
 
 let logger: Logger;
 let configService: ConfigService;
@@ -66,8 +68,9 @@ export async function activate(context: vscode.ExtensionContext) {
 	try {
 		// Initialize services
 		logger = new Logger('Verno');
-		logger.show(); // Auto-show logs on startup for debugging
 		configService = new ConfigService();
+		configService.setSecretStorage(context.secrets); // Secure API key storage
+		logger.info('Verno extension activated. Use "Verno: Show Output" to view logs.');
 		fileService = new FileService();
 		agentRegistry = new AgentRegistry();
 		llmService = new LLMService();
@@ -169,6 +172,19 @@ export async function activate(context: vscode.ExtensionContext) {
 			await loadConversation(conversationId);
 		});
 
+		// Register SDLC Start command
+		const startSDLCCmd = vscode.commands.registerCommand('verno.startSDLC', async (topic?: string) => {
+			SDLCWebviewPanel.createOrShow(context, logger, llmService, topic);
+		});
+
+		// Register BMAD continuation command (called by SDLC after PRD approval)
+		const startBMADCmd = vscode.commands.registerCommand('verno.startBMADAfterSDLC', async (prd: PRDDocument) => {
+			const orchestrator = agentRegistry.get('orchestrator') as OrchestratorAgent;
+			if (orchestrator) {
+				await orchestrator.onPRDApproved(prd, context);
+			}
+		});
+
 		// Register new task command
 		const newTaskCmd = vscode.commands.registerCommand('verno.newTask', async () => {
 			logger.info('New task requested');
@@ -215,19 +231,24 @@ export async function activate(context: vscode.ExtensionContext) {
 			logger.info(`Voice conversation complete. Summary length: ${summary.length}, turns: ${transcript?.length || 0}`);
 			agentPanel.addMessage('system', '🎙️ Voice conversation captured. Processing your request...');
 
-			// Try to find an API key from configured providers
-			// The webview state isn't accessible from the extension, so prompt if needed
-			const apiKey = await vscode.window.showInputBox({
-				prompt: 'Enter your API key to process the voice conversation summary',
-				password: true,
-				ignoreFocusOut: true,
-				placeHolder: 'API key (Gemini: AIza... or Groq)'
-			});
-
+			// Retrieve API key from SecretStorage (try gemini first, then groq)
+			let apiKey = await configService.getApiKey('gemini') || await configService.getApiKey('groq');
+			if (!apiKey) {
+				apiKey = await vscode.window.showInputBox({
+					prompt: 'Enter your API key to process the voice conversation (stored securely)',
+					password: true,
+					ignoreFocusOut: true,
+					placeHolder: 'API key (Gemini: AIza... or Groq)'
+				});
+				if (apiKey) {
+					const provider = configService.detectProvider(apiKey);
+					await configService.storeApiKey(provider, apiKey);
+				}
+			}
 			if (apiKey) {
 				await processUserInput(context, apiKey, summary, 'plan', { fromWebview: false });
 			} else {
-				agentPanel.addMessage('system', 'No API key provided. Your voice summary has been added to the chat. You can send it manually using the Send button.');
+				agentPanel.addMessage('system', 'No API key provided. Configure one in Verno settings.');
 			}
 		});
 
@@ -287,7 +308,28 @@ export async function activate(context: vscode.ExtensionContext) {
 			});
 		});
 
-		context.subscriptions.push(processCommand, processWithData, showOutputCmd, recordingStatus, loadConversationCmd, newTaskCmd, mcpInstallCmd, listConvsCmd, deleteConvCmd, voiceConvCmd, processVoiceCmd, newConversationCmd);
+		// Clear stored API keys command
+		const clearApiKeysCmd = vscode.commands.registerCommand('verno.clearApiKeys', async () => {
+			const providers: Array<{ label: string; provider: import('./config/ConfigService').ProviderName }> = [
+				{ label: 'Gemini', provider: 'gemini' },
+				{ label: 'Groq', provider: 'groq' },
+				{ label: 'Anthropic', provider: 'anthropic' },
+				{ label: 'OpenAI', provider: 'openai' },
+			];
+			const selected = await vscode.window.showQuickPick(
+				providers.map(p => p.label),
+				{ placeHolder: 'Select a provider to clear its API key', canPickMany: true }
+			);
+			if (!selected || selected.length === 0) { return; }
+			for (const label of selected) {
+				const p = providers.find(x => x.label === label)!;
+				await configService.deleteApiKey(p.provider);
+				logger.info(`Cleared API key for ${label}`);
+			}
+			vscode.window.showInformationMessage(`Cleared keys for: ${selected.join(', ')}`);
+		});
+
+		context.subscriptions.push(processCommand, processWithData, showOutputCmd, recordingStatus, loadConversationCmd, newTaskCmd, mcpInstallCmd, listConvsCmd, deleteConvCmd, voiceConvCmd, processVoiceCmd, newConversationCmd, startSDLCCmd, startBMADCmd, clearApiKeysCmd);
 
 		logger.info('Verno extension activated successfully');
 		vscode.window.showInformationMessage('Verno extension is ready!');
@@ -356,16 +398,28 @@ async function processUserInput(
 		let apiKey = apiKeyArg;
 		let input = inputArg;
 
+		// Retrieve API key from SecretStorage — only prompt if not yet stored
 		if (!apiKey) {
-			apiKey = await vscode.window.showInputBox({
-				prompt: 'Enter your API key (Gemini: AIza... or Groq)',
-				password: true,
-				ignoreFocusOut: true
-			});
+			const modelName = options.model || '';
+			const preferredProvider = modelName === 'groq' ? 'groq' : 'gemini';
+			apiKey = await configService.getApiKey(preferredProvider)
+				|| await configService.getApiKey('groq')
+				|| await configService.getApiKey('gemini');
 
 			if (!apiKey) {
-				logger.warn('No API key provided');
-				return;
+				apiKey = await vscode.window.showInputBox({
+					prompt: 'Enter your API key (Gemini: AIza... or Groq). It will be stored securely.',
+					password: true,
+					ignoreFocusOut: true
+				});
+				if (!apiKey) {
+					logger.warn('No API key provided');
+					return;
+				}
+				// Persist to SecretStorage so future calls don't need to prompt
+				const detectedProvider = configService.detectProvider(apiKey);
+				await configService.storeApiKey(detectedProvider, apiKey);
+				logger.info(`API key stored securely for provider: ${detectedProvider}`);
 			}
 		}
 
@@ -443,7 +497,20 @@ async function processUserInput(
 				`You are a helpful coding assistant. The user is asking about their project.\n\nUser question: ${input}\n\nProvide a clear, concise answer.`
 			);
 		} else if (mode === 'plan') {
-			// Plan mode: generate plan + run non-coding agents
+			// Plan mode detection: Should we trigger SDLC?
+			const lowerInput = input.toLowerCase();
+			const looksLikeProject = lowerInput.includes('build a') || lowerInput.includes('create a new') || lowerInput.includes('create an app') || input.split(' ').length > 50;
+			
+			if (looksLikeProject) {
+				const choice = await vscode.window.showInformationMessage('This looks like a large feature or project request. Would you like to run the SDLC Flow (PRD Generation + Jira Sync) first?', 'Yes, run SDLC', 'No, just generate code');
+				if (choice === 'Yes, run SDLC') {
+					agentPanel.showThinking(false);
+					vscode.commands.executeCommand('verno.startSDLC', input);
+					return;
+				}
+			}
+
+			// Traditional Plan mode: generate plan + run non-coding agents
 			const orchestrator = agentRegistry.get('orchestrator') as OrchestratorAgent;
 			if (!orchestrator) {
 				throw new Error('Orchestrator agent not found');
