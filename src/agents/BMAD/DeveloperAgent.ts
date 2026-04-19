@@ -89,17 +89,33 @@ export class DeveloperAgent extends BaseAgent {
     // Retrieve high-density Tiered Context via Import Graph + Local RAG pipeline
     let existingFilesContext = '';
     if (context.workspaceRoot) {
-      this.lazyInitRagServices(context.workspaceRoot);
-      if (this.indexingService && this.contextEngine) {
-        this.log('Building Structural/Semantic Context...');
-        // Fire-and-forget background indexing (Tier 2 baseline)
-        this.indexingService.indexWorkspace(context.workspaceRoot, this);
+      try {
+        this.lazyInitRagServices(context.workspaceRoot);
+        if (this.indexingService && this.contextEngine) {
+          this.log('Building Structural/Semantic Context...');
+          // Fire-and-forget background indexing (Tier 2 baseline)
+          this.indexingService.indexWorkspace(context.workspaceRoot, this).catch((ragErr: any) => {
+            this.log(`Background RAG indexing failed (non-fatal): ${ragErr?.message ?? ragErr}`, 'warn');
+          });
 
-        // Fetch Tier 1 (Structural) + Tier 2 (Vector Fallback)
-        existingFilesContext = await this.contextEngine.getTieredContext(userRequest, 8);
-        this.log(`Retrieved Tiered context chunks. Size: ${existingFilesContext.length} chars`);
+          // Fetch Tier 1 (Structural) + Tier 2 (Vector Fallback)
+          existingFilesContext = await this.contextEngine.getTieredContext(userRequest, 8);
+          this.log(`Retrieved Tiered context chunks. Size: ${existingFilesContext.length} chars`);
+        }
+      } catch (ragErr: any) {
+        // Native module (e.g. sharp via @xenova/transformers) unavailable — degrade gracefully.
+        // Code generation proceeds without semantic context.
+        this.log(`RAG context unavailable (native module issue — ${ragErr?.message ?? ragErr}). Proceeding without context.`, 'warn');
+        existingFilesContext = '';
       }
     }
+
+    let hasCodeFiles = false;
+    if (context.workspaceRoot) {
+      const analyzer = new ProjectAnalyzer(context.workspaceRoot);
+      hasCodeFiles = !analyzer.isNewProject();
+    }
+
     const hasExistingCode = existingFilesContext.length > 0;
 
     // Detect target language from the user request
@@ -107,7 +123,7 @@ export class DeveloperAgent extends BaseAgent {
 
     // Build the prompt based on mode
     let prompt: string;
-    if (editMode || hasExistingCode) {
+    if (editMode || hasCodeFiles) {
       prompt = this.buildEditPrompt(
         userRequest,
         conversationHistory,
@@ -172,24 +188,36 @@ export class DeveloperAgent extends BaseAgent {
           try {
             const filePath = `${context.workspaceRoot}/${file.name}`;
             
-            if (file.isDiff && fs.existsSync(filePath)) {
-               // COD-03: Incremental differ
-               try {
-                 this.log(`Applying incremental patch to: ${file.name}`);
-                 await (this.fileService as any).applyPatch(filePath, file.content);
-                 this.changeTracker.recordChange(filePath, 'Applied diff patch'); // Note: actual new content is retrieved later
-                 this.log(`Patched existing file: ${file.name}`);
-                 completedTasks.push(`Patched ${file.name}`);
-               } catch (diffErr: any) {
-                 this.log(`Failed to apply patch to ${file.name}: ${diffErr.message}`, 'error');
-                 issues.push({
-                   severity: 'high',
-                   description: `Patch application failed for ${file.name}`,
-                   context: `Could not safely merge the diff snippet. Ensure the 'old code' matches exactly. Error: ${diffErr.message}`
-                 });
+            if (file.isDiff) {
+               // COD-03: Incremental differ — diff markers detected in LLM output
+               if (fs.existsSync(filePath)) {
+                 // File exists: try applying the patch
+                 try {
+                   this.log(`Applying incremental patch to: ${file.name}`);
+                   await (this.fileService as any).applyPatch(filePath, file.content);
+                   this.changeTracker.recordChange(filePath, 'Applied diff patch');
+                   this.log(`Patched existing file: ${file.name}`);
+                   completedTasks.push(`Patched ${file.name}`);
+                 } catch (diffErr: any) {
+                   // Patch failed (e.g. context mismatch) — fall back to extracting new code
+                   this.log(`Patch failed for ${file.name}, falling back to new-code extraction: ${diffErr.message}`, 'warn');
+                   const newContent = this.extractNewCodeFromDiff(file.content);
+                   await this.fileService.updateFile(filePath, newContent, true);
+                   this.changeTracker.recordChange(filePath, newContent);
+                   this.log(`Overwrote ${file.name} with extracted new code (patch fallback)`);
+                   completedTasks.push(`Updated ${file.name} (diff fallback)`);
+                 }
+               } else {
+                 // New file: NEVER write raw diff markers — extract the new-code portion only
+                 this.log(`Diff for new file ${file.name} — extracting new code block`);
+                 const newContent = this.extractNewCodeFromDiff(file.content);
+                 await this.fileService.createFile(filePath, newContent);
+                 this.changeTracker.recordChange(filePath, newContent);
+                 this.log(`Created new file from diff: ${file.name}`);
+                 completedTasks.push(`Created ${file.name} (from diff)`);
                }
             } else {
-               // Use updateFile for existing full-file overrides, createFile for new
+               // Full file content — write directly
                if (fs.existsSync(filePath)) {
                  await this.fileService.updateFile(filePath, file.content, /* allowOverwrite */ true);
                  this.log(`Updated existing file: ${file.name}`);
@@ -266,13 +294,38 @@ export class DeveloperAgent extends BaseAgent {
           this.log(`npm install: ${stdout}`);
           completedTasks.push('Installed dependencies');
         } catch (error: any) {
-          this.log(`npm install failed: ${error.message}`, 'warn');
-          issues.push({
-            severity: 'medium',
-            description: 'npm install failed',
-            context: error.message
-          });
-          suggestions.push('Check package.json for dependency issues');
+          const errMsg: string = error.message || '';
+
+          // Detect native binary / prebuild failures (e.g. sharp, canvas, bcrypt)
+          // These are environment-level issues — NOT code quality issues — and must NOT
+          // block the rest of the pipeline. We surface them as non-fatal suggestions.
+          const NATIVE_MODULE_PATTERNS = [
+            /sharp/i,
+            /node-gyp/i,
+            /prebuild-install/i,
+            /binding\.gyp/i,
+            /ELIFECYCLE/i,
+            /Cannot find module.*\.node/i,
+          ];
+          const isNativeModuleError = NATIVE_MODULE_PATTERNS.some(p => p.test(errMsg));
+
+          if (isNativeModuleError) {
+            this.log(`npm install: native module build issue detected (non-fatal). ${errMsg.substring(0, 200)}`, 'warn');
+            suggestions.push(
+              '⚠️ A native module failed to build on this machine (likely \'sharp\' or similar). ' +
+              'This does NOT affect the generated code. To fix it manually, run:\n' +
+              '  npm install --platform=win32 --arch=x64 sharp\n' +
+              'or follow https://sharp.pixelplumbing.com/install'
+            );
+          } else {
+            this.log(`npm install failed: ${errMsg}`, 'warn');
+            issues.push({
+              severity: 'medium',
+              description: 'npm install failed',
+              context: errMsg
+            });
+            suggestions.push('Check package.json for dependency issues');
+          }
         }
       }
     } catch (error) {
@@ -408,64 +461,76 @@ export class DeveloperAgent extends BaseAgent {
 
   private parseCodeFiles(content: string): Array<{ name: string; content: string; isDiff?: boolean }> {
     const files: Array<{ name: string; content: string; isDiff?: boolean }> = [];
+    /** Deduplication — first writer wins */
+    const seen = new Set<string>();
+    const add = (name: string, rawContent: string, isDiff?: boolean) => {
+      const n = name.trim().replace(/^`+|`+$/g, '').trim(); // strip stray backticks from filename
+      if (!n || seen.has(n) || rawContent.trim().length === 0) { return; }
+      seen.add(n);
+      files.push({ name: n, content: rawContent.trim(), isDiff });
+    };
 
-    // TIER 0: Parse Diffs (Incremental Change Blocks) first
-    // Pattern: ```diff FILE: relative/path.ts\n<<<<\nOLD\n====\nNEW\n>>>>\n```
-    const diffRegex = /```diff\s*\n(?:FILE|EDIT):\s*([^\n]+)\s*\n([\s\S]*?)```/g;
     let match;
+
+    // ── Pass 0: ```diff\nFILE: filename\n<<<<====>>>>``` blocks ──────────────────
+    const diffRegex = /```diff\s*\n(?:FILE|EDIT):\s*([^\n]+)\s*\n([\s\S]*?)```/g;
     while ((match = diffRegex.exec(content)) !== null) {
-      const filename = match[1].trim();
-      const diffContent = match[2].trim();
-      if (filename && diffContent) {
-        files.push({ name: filename, content: diffContent, isDiff: true });
-      }
+      add(match[1], match[2], true);
     }
 
-    // TIER 1: Try FILE:/EDIT: format first (preferred)
-    // Pattern A: Inline format (```FILE: name\ncontent```)
+    // ── Pass 1a: ```FILE: name\ncontent``` (inline fenced — preferred format) ───────
     const inlineRegex = /```(?:FILE|EDIT):\s*([^\n]+)\n([\s\S]*?)```/g;
     while ((match = inlineRegex.exec(content)) !== null) {
-      const filename = match[1].trim();
-      const filecontent = match[2].trim();
-      if (filename && filecontent && !files.some(f => f.name === filename)) {
-        files.push({ name: filename, content: filecontent });
-      }
+      const hasDiffMarkers = /^<{3,}/m.test(match[2]);
+      add(match[1], match[2], hasDiffMarkers);
     }
 
-    // Pattern B: Split format (FILE: name\n```lang\ncontent```)
+    // ── Pass 1b: FILE: name\n```lang\ncontent``` (split fenced) ─────────────
     const splitRegex = /(?:^|\n)(?:FILE|EDIT):\s*([^\n]+)\s*\n+\s*```(?:\w+)?\s*\n([\s\S]*?)```/g;
     while ((match = splitRegex.exec(content)) !== null) {
-      const filename = match[1].trim();
-      const filecontent = match[2].trim();
-      if (filename && filecontent && !files.some(f => f.name === filename)) {
-        files.push({ name: filename, content: filecontent });
-      }
+      const hasDiffMarkers = /^<{3,}/m.test(match[2]);
+      add(match[1], match[2], hasDiffMarkers);
     }
 
-    // TIER 3: Raw format (# file: name ... content ...)
-    // Handles cases where LLM dumps raw text with comment headers and NO code fences
+    // ── Pass 1c: Bare FILE: blocks — LLM forgot backtick fences ─────────────
+    // This is the most common LLM failure mode: outputting FILE: lines without
+    // surrounding triple-backtick fences. The content runs until the next FILE:
+    // block, a code fence, or end of string.
+    //
+    // Also handles:
+    //   "NEW FILE: path"    (LLM adds "NEW " prefix)
+    //   "#### FILE: `path`" (LLM wraps path in markdown formatting)
+    const bareFileRegex =
+      /(?:^|\n)(?:#{1,6}\s+)?(?:NEW\s+)?(?:FILE|EDIT):\s*`?([^\n`]+?)`?\s*\n((?:(?!\n(?:#{0,6}\s+)?(?:NEW\s+)?(?:FILE|EDIT):|```)(?:.|\n))*)/gi;
+    while ((match = bareFileRegex.exec(content)) !== null) {
+      let filecontent = match[2].trim();
+      // If the content is itself inside a fence, unwrap it
+      if (filecontent.startsWith('```') && filecontent.includes('\n')) {
+        filecontent = filecontent.replace(/^```(?:\w+)?\s*\n/, '').replace(/\n```\s*$/, '').trim();
+      }
+      const hasDiffMarkers = /^<{3,}/m.test(filecontent);
+      add(match[1], filecontent, hasDiffMarkers);
+    }
+
+    // ── Pass 2: # file: / // file: raw comment headers ────────────────────
     const rawFileRegex = /(?:^|\n)(?:#|\/\/)\s*file:\s*([^\n]+)\s*\n([\s\S]*?)(?=\n(?:#|\/\/)\s*file:|$)/gi;
     while ((match = rawFileRegex.exec(content)) !== null) {
-      const filename = match[1].trim();
       let filecontent = match[2].trim();
-
-      // If content is wrapped in fences, unwrap it (mixed format)
       if (filecontent.startsWith('```') && filecontent.endsWith('```')) {
         filecontent = filecontent.replace(/^```(?:\w+)?\s*\n/, '').replace(/\n```$/, '');
       }
-
-      if (filename && filecontent && !files.some(f => f.name === filename)) {
-        files.push({ name: filename, content: filecontent });
-      }
+      add(match[1], filecontent);
     }
 
+    // If ANY named files were found, return them — skip unnamed fallback
     if (files.length > 0) {
-      this.log(`Parsed ${files.length} files using FILE:/EDIT: format`);
+      this.log(`Parsed ${files.length} named files from LLM output`);
       return files;
     }
 
-    // TIER 2: Fallback — extract any fenced code block with language identifier
-    this.log('No FILE:/EDIT: blocks found, falling back to language-tagged code blocks');
+    // ── Pass 3 (last resort): Unnamed language-tagged fenced blocks ──────────
+    // Only reached when the LLM output has NO FILE: labels at all.
+    this.log('No named FILE: blocks found, falling back to language-tagged code blocks');
     const langBlockRegex = /```(\w+)\s*\n([\s\S]*?)```/g;
     const langToExt: Record<string, string> = {
       html: '.html', htm: '.html',
@@ -523,6 +588,43 @@ export class DeveloperAgent extends BaseAgent {
     }
 
     return files;
+  }
+
+  /**
+   * Extract the "new" code portions from a diff block.
+   *
+   * Supports the LLM's inline diff format:
+   *   <<<<
+   *   old code
+   *   ====
+   *   new code
+   *   >>>>
+   *
+   * For a file with multiple hunks, joins all new-code sections.
+   * Falls back to the raw content if no diff markers are found.
+   */
+  private extractNewCodeFromDiff(diffContent: string): string {
+    // Regex: match each hunk — capture everything between ==== and >>>>
+    // Supports 3+ chars for each marker to be lenient with LLM output (3='s etc.)
+    const hunkRegex = /<{3,}[^\n]*\n[\s\S]*?={3,}[^\n]*\n([\s\S]*?)>{3,}/g;
+    const newParts: string[] = [];
+    let match;
+    let hasHunks = false;
+
+    while ((match = hunkRegex.exec(diffContent)) !== null) {
+      hasHunks = true;
+      const newCode = match[1].replace(/\n$/, ''); // trim trailing newline only
+      if (newCode.trim().length > 0) {
+        newParts.push(newCode);
+      }
+    }
+
+    if (!hasHunks) {
+      // No valid diff markers found — return content as-is
+      return diffContent;
+    }
+
+    return newParts.join('\n\n');
   }
 
   /**
@@ -617,20 +719,36 @@ ${analysis ? `ANALYSIS:\n${analysis.substring(0, 2000)}\n` : ''}${architecture ?
 RULES:
 - Generate FULLY WORKING, COMPLETE code. No stubs, no placeholders.
 - Every function must have a real implementation.
-- Include README.md and package.json if applicable.
+- You are bootstrapping a NEW project from scratch. Even if the task seems focused on a specific feature, you MUST generate ALL standard required scaffolding (e.g., package.json, index.html, Vite/Webpack config, tsconfig.json, routing).
+- You MUST include a root-level package.json with all required dependencies and scripts (dev, build, preview).
+- If building a React web application, you MUST use either Next.js (App Router) or Vite (React SPA). DO NOT build custom Express+React SSR setups.
+- You MUST include the exact build tool configurations (e.g., vite.config.ts or next.config.mjs).
+- Include README.md as the last file.
 ${detectedLang ? `- You MUST use ${detectedLang}. Do NOT use any other language.\n` : ''}
-OUTPUT FORMAT (MANDATORY):
-Wrap each file in a code block labeled with FILE: like this:
+OUTPUT FORMAT — MANDATORY RULES:
+1. Wrap EVERY file in triple-backtick code fences labeled with FILE:.
+2. NEVER output a bare \`FILE: path/to/file\` without surrounding triple-backtick fences.
+3. Use EXACTLY this format for every file — no exceptions, no variations:
 
-\`\`\`FILE: index.html
-<!DOCTYPE html>...
+\`\`\`FILE: package.json
+{
+  "name": "my-app",
+  ...
+}
 \`\`\`
 
-\`\`\`FILE: styles.css
-body { ... }
+\`\`\`FILE: vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+...
 \`\`\`
 
-You MUST output complete code using the format above. Do not describe what you would do. Write the actual code.`;
+\`\`\`FILE: src/main.tsx
+import React from 'react';
+...
+\`\`\`
+
+Every single file MUST follow this exact format. Missing the backtick fences means the file will NOT be created on disk.`;
   }
 
   /**

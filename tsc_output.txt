@@ -1,0 +1,27 @@
+﻿node : node:internal/modules/cjs/loader:1147
+At line:1 char:1
++ node .\node_modules\typescript\bin\tsc -p ./ 2>&1 
+| Out-File -Encodin ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (node:in 
+   ternal/modules/cjs/loader:1147:String) [], Remot  
+  eException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  throw err;
+  ^
+
+Error: Cannot find module 
+'D:\Verno\node_modules\typescript\bin\tsc'
+    at Module._resolveFilename 
+(node:internal/modules/cjs/loader:1144:15)
+    at Module._load 
+(node:internal/modules/cjs/loader:985:27)
+    at Function.executeUserEntryPoint [as runMain] 
+(node:internal/modules/run_main:135:12)
+    at node:internal/main/run_main_module:28:49 {
+  code: 'MODULE_NOT_FOUND',
+  requireStack: []
+}
+
+Node.js v21.1.0

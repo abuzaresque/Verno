@@ -566,7 +566,11 @@ export function getConversationHTML(nonce: string, vadPaths?: VadPaths): string 
                 var d=document.createElement('div'); d.className='prov-item';
                 d.innerHTML='<span class="prov-dot on"></span><span class="prov-name">'+esc(p.name)+'</span><span class="prov-key">'+esc(p.key.substring(0,8))+'...</span>';
                 var del=document.createElement('button'); del.className='prov-del'; del.textContent='\u00D7';
-                del.addEventListener('click',function(){S.providers.splice(i,1);save();renderProviders();checkApiKey();});
+                del.addEventListener('click',function(){
+                    S.providers.splice(i,1);
+                    save();renderProviders();checkApiKey();
+                    vscode.postMessage({ type: 'deleteApiKey', provider: p.id });
+                });
                 d.appendChild(del); list.appendChild(d);
             });
         }
@@ -583,6 +587,7 @@ export function getConversationHTML(nonce: string, vadPaths?: VadPaths): string 
             save(); sel.value=''; keyInp.value='';
             renderProviders(); checkApiKey();
             addMsg('system',names[id]+' API key saved.');
+            vscode.postMessage({ type: 'saveApiKey', provider: id, apiKey: key });
         });
 
         // Workspace info
@@ -872,6 +877,7 @@ export function getConversationHTML(nonce: string, vadPaths?: VadPaths): string 
                 S.providers=S.providers.filter(function(p){return p.id!==prov;});
                 S.providers.push({id:prov,name:prov,key:k});
                 save();apiKeyInp.value='';checkApiKey();
+                vscode.postMessage({ type: 'saveApiKey', provider: prov, apiKey: k });
             }}
         });
 
@@ -879,7 +885,14 @@ export function getConversationHTML(nonce: string, vadPaths?: VadPaths): string 
         if(sendBtn) sendBtn.addEventListener('click',function(){sendMessage();});
         if(sdlcBtn) sdlcBtn.addEventListener('click',function(){
             var text = msgInput ? msgInput.value.trim() : '';
-            vscode.postMessage({type:'start-sdlc', input: text});
+            var apiKey = getProviderKey(S.provider || S.model);
+            vscode.postMessage({
+                type:'start-sdlc', 
+                input: text, 
+                apiKey: apiKey,
+                provider: S.provider,
+                model: S.model
+            });
             if(msgInput) { msgInput.value=''; msgInput.style.height='auto'; }
         });
         if(msgInput) msgInput.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage();}});
@@ -1400,6 +1413,12 @@ window.addEventListener('message', event => {
     }
     else if (m.type === 'thinking') {
         if (window.handleThinkingState) window.handleThinkingState(m.show);
+    }
+    else if (m.type === 'apiKeySaved') {
+        addMsg('system', 'Provider ' + m.provider + ' is active and re-initialized successfully.');
+    }
+    else if (m.type === 'apiKeyDeleted') {
+        addMsg('system', 'Provider ' + m.provider + ' credentials removed from memory.');
     }
     else if (m.type === 'restoreVoiceSession') {
         // Restore UI without greeting

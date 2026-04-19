@@ -34,7 +34,7 @@ export class SDLCWebviewPanel {
     private readonly context: vscode.ExtensionContext;
     private readonly logger: Logger;
     private readonly llmService: LLMService;
-    
+
     private state: SDLCState = {
         currentPhase: 'TOPIC_INPUT',
         topic: '',
@@ -62,7 +62,7 @@ export class SDLCWebviewPanel {
             this.logger.info(`[SDLCWebviewPanel] Received message: ${JSON.stringify(message)}`);
             if (!validateWebviewMessage(message, SDLC_ALLOWED_TYPES, this.logger)) { return; }
             const msg = message as any; // type validated above
-            switch(msg.type) {
+            switch (msg.type) {
                 case 'start-debate':
                     this.state.topic = msg.topic;
                     this.setPhase('DEBATE');
@@ -124,15 +124,22 @@ export class SDLCWebviewPanel {
         if (prd) {
             // Debate already done in sidebar — jump straight to PRD review
             SDLCWebviewPanel.currentPanel.state.prdDocument = prd;
+
+            // Save state immediately prior to timeout so that if the webview 
+            // requests load-state it gets the correct phase
+            SDLCWebviewPanel.currentPanel.state.currentPhase = 'PRD_REVIEW';
+            SDLCWebviewPanel.currentPanel.saveState();
+
+            // Keep timeout as a fallback but allow load-state to trigger render natively
             setTimeout(() => {
-                SDLCWebviewPanel.currentPanel?.setPhase('PRD_REVIEW');
+                SDLCWebviewPanel.currentPanel?.panel.webview.postMessage({ type: 'phase-changed', phase: 'PRD_REVIEW' });
                 SDLCWebviewPanel.currentPanel?.panel.webview.postMessage({ type: 'prd-ready', payload: prd });
-            }, 300);
+            }, 800); // increased timeout to allow larger webview to hook events
         } else if (topic) {
             // Legacy: show topic input with pre-filled topic
             setTimeout(() => {
                 SDLCWebviewPanel.currentPanel?.panel.webview.postMessage({ type: 'init-topic', topic });
-            }, 500);
+            }, 800);
         }
     }
 
@@ -175,7 +182,7 @@ export class SDLCWebviewPanel {
         try {
             const topic = feedback ? `Feedback on previous PRD: ${feedback}` : this.state.topic;
             this.logger.info(`[SDLCWebviewPanel] Starting debate flow for topic: ${topic}`);
-            
+
             const prd = await this.debateOrchestrator.runDebate(topic, (msg) => {
                 this.state.debateMessages.push(msg);
                 this.saveState();
@@ -190,13 +197,13 @@ export class SDLCWebviewPanel {
         } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
             this.logger.error('[SDLCWebviewPanel] Debate flow failed', error as Error);
-            this.panel.webview.postMessage({ 
-                type: 'debate-message', 
-                payload: { 
-                    agent: 'System', 
+            this.panel.webview.postMessage({
+                type: 'debate-message',
+                payload: {
+                    agent: 'System',
                     content: `❌ Error: ${msg}. Please check your API keys or connection.`,
                     type: 'error'
-                } 
+                }
             });
             vscode.window.showErrorMessage(`Verno SDLC Error: ${msg}`);
         }
@@ -205,7 +212,7 @@ export class SDLCWebviewPanel {
     private async decomposePRD() {
         try {
             if (!this.state.prdDocument) return;
-            
+
             this.logger.info('[SDLCWebviewPanel] Decomposing PRD into Epics and Stories...');
             const prompt = `You are a Technical Agile Coach. Decompose the following PRD into Epics, Stories, and SubTasks.
 Crucially, DIVIDE THESE TASKS exclusively among the 7 BMAD Agents: 
@@ -243,7 +250,7 @@ Respond ONLY with valid JSON matching this structure:
 ]`;
 
             let prdJson = await this.llmService.generateText(prompt);
-        
+
             // Robust JSON extraction
             const jsonMatch = prdJson.match(/\[\s*\{[\s\S]*\}\s*\]/);
             if (jsonMatch) {
@@ -263,10 +270,10 @@ Respond ONLY with valid JSON matching this structure:
             }
             this.saveState();
             this.panel.webview.postMessage({ type: 'tasks-ready', payload: this.state.epics });
-            
+
             const isAuth = await JiraAuthService.getInstance(this.context).isAuthenticated();
             this.panel.webview.postMessage({ type: 'jira-status', isAuth });
-        } catch(error) {
+        } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
             this.logger.error('[SDLCWebviewPanel] PRD decomposition failed', error as Error);
             vscode.window.showErrorMessage(`Verno Task Generation Error: ${msg}. Check logs and retry.`);
@@ -284,17 +291,17 @@ Respond ONLY with valid JSON matching this structure:
 
         const root = this.getWorkspaceRoot();
         if (!root) return;
-        
+
         let config: any = {};
         try {
             config = JSON.parse(fs.readFileSync(path.join(root, '.verno', 'jira-config.json'), 'utf-8'));
-        } catch(e) {
+        } catch (e) {
             vscode.window.showErrorMessage('Jira config missing. Run Jira Setup first.');
             return;
         }
 
         const syncService = new JiraSyncService(this.logger);
-        
+
         await syncService.syncEpics(
             this.state.epics,
             creds,
@@ -475,8 +482,8 @@ Respond ONLY with valid JSON matching this structure:
     <!-- PRE-LOAD Check -->
     <div id="loading" class="section active" style="text-align:center; padding:40px; opacity:0.7;">
         <div style="font-size:24px; margin-bottom:8px;">⚙️</div>
-        <div>Preparing PRD Review…</div>
-        <div style="font-size:11px; margin-top:8px; opacity:0.5;">The AI debate runs in the sidebar chat panel.</div>
+        <div>Loading SDLC Workspace…</div>
+        <div style="font-size:11px; margin-top:8px; opacity:0.5;">Please wait while the AI syncs with your project.</div>
     </div>
 
     <!-- TOPIC_INPUT -->
@@ -540,13 +547,10 @@ Respond ONLY with valid JSON matching this structure:
             const msg = e.data;
             if (msg.type === 'state-loaded') {
                 state = msg.state;
-                if (state.currentPhase !== 'TOPIC_INPUT') {
-                    showSection(state.currentPhase);
-                    if (state.debateMessages) state.debateMessages.forEach(appendDebateMsg);
-                    if (state.prdDocument) renderPRD(state.prdDocument);
-                    if (state.epics && state.epics.length>0) renderEpics(state.epics);
-                }
-                // else stay on loading spinner — prd-ready will arrive shortly
+                showSection(state.currentPhase);
+                if (state.debateMessages && state.debateMessages.length > 0) state.debateMessages.forEach(appendDebateMsg);
+                if (state.prdDocument) renderPRD(state.prdDocument);
+                if (state.epics && state.epics.length > 0) renderEpics(state.epics);
             } else if (msg.type === 'init-topic') {
                 // Legacy path only: pre-fill topic input without auto-triggering debate
                 const ti = document.getElementById('topicInput');
@@ -599,29 +603,44 @@ Respond ONLY with valid JSON matching this structure:
         }
 
         function renderPRD(prd) {
-            let html = '<h2>' + prd.title + '</h2>';
-            prd.sections.forEach(s => {
-                const isSecSection = s.title.toLowerCase().includes('security');
-                const cssClass = 'prd-section' + (isSecSection ? ' security-section' : '');
-                // Content: replace literal \\n and newlines with <br/>
-                const contentHtml = s.content
-                    .replace(/\\n/g, '<br/>')
-                    .replace(/\n/g, '<br/>');
-                let flagsHtml = '';
-                if (s.complianceFlags && s.complianceFlags.length > 0) {
-                    flagsHtml = '<div class="compliance-flags">';
-                    s.complianceFlags.forEach(flag => {
-                        let cls = 'flag-badge ';
-                        if (flag.includes('GDPR')) cls += 'flag-gdpr';
-                        else if (flag.includes('HIPAA')) cls += 'flag-hipaa';
-                        else cls += 'flag-owasp';
-                        flagsHtml += '<span class="' + cls + '">' + flag + '</span>';
-                    });
-                    flagsHtml += '</div>';
+            try {
+                let html = '<h2>' + (prd.title || 'Product Requirements Document') + '</h2>';
+                if (!prd.sections || !Array.isArray(prd.sections)) {
+                    document.getElementById('prdContent').innerHTML = html + '<p>No valid sections output from AI.</p>';
+                    return;
                 }
-                html += '<div class="' + cssClass + '"><h4>' + s.title + '</h4><div>' + contentHtml + '</div>' + flagsHtml + '</div>';
-            });
-            document.getElementById('prdContent').innerHTML = html;
+                prd.sections.forEach(s => {
+                    const sTitle = typeof s.title === 'string' ? s.title : 'Section';
+                    const isSecSection = sTitle.toLowerCase().includes('security');
+                    const cssClass = 'prd-section' + (isSecSection ? ' security-section' : '');
+                    
+                    let textContent = '';
+                    if (typeof s.content === 'string') textContent = s.content;
+                    else if (s.content) textContent = JSON.stringify(s.content);
+                    
+                    // Content: replace literal \\n and newlines with <br/>
+                    const contentHtml = textContent
+                        .replace(/\\\\n/g, '<br/>')
+                        .replace(/\\n/g, '<br/>');
+                    let flagsHtml = '';
+                    if (s.complianceFlags && s.complianceFlags.length > 0) {
+                        flagsHtml = '<div class="compliance-flags">';
+                        s.complianceFlags.forEach(flag => {
+                            let cls = 'flag-badge ';
+                            if (flag.includes('GDPR')) cls += 'flag-gdpr';
+                            else if (flag.includes('HIPAA')) cls += 'flag-hipaa';
+                            else cls += 'flag-owasp';
+                            flagsHtml += '<span class="' + cls + '">' + flag + '</span>';
+                        });
+                        flagsHtml += '</div>';
+                    }
+                    html += '<div class="' + cssClass + '"><h4>' + sTitle + '</h4><div>' + contentHtml + '</div>' + flagsHtml + '</div>';
+                });
+                document.getElementById('prdContent').innerHTML = html;
+            } catch (err) {
+                console.error('[Webview] Failed to render PRD:', err);
+                document.getElementById('prdContent').innerHTML = '<div style="color:var(--destructive)">Failed to render PRD. See logs.</div>';
+            }
         }
 
         function renderEpics(epics) {

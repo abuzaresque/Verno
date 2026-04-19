@@ -21,37 +21,82 @@ export class GroqProvider implements ILLMProvider {
       throw new Error('Groq API key not set');
     }
 
-    try {
+    const PRIMARY_MODEL = 'llama-3.3-70b-versatile';
+    const FALLBACK_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+    const RETRY_WAIT_MS = 60_000;
+
+    const buildBody = (model: string) => JSON.stringify({
+      messages: [{ role: 'user', content: prompt }],
+      model,
+      temperature: (options?.temperature as number) || 0.7,
+      max_tokens: (options?.maxTokens as number) || 2000,
+      top_p: 0.95
+    });
+
+    const callApi = async (model: string): Promise<{ ok: boolean; status: number; data: any }> => {
       const response = await fetch(this.apiEndpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${this.apiKey}`
         },
-        body: JSON.stringify({
-          messages: [
-            {
-              role: 'user',
-              content: prompt
-            }
-          ],
-          model: this.model,
-          temperature: (options?.temperature as number) || 0.7,
-          max_tokens: (options?.maxTokens as number) || 2000,
-          top_p: 0.95
-        })
+        body: buildBody(model)
       });
+      const data: any = await response.json();
+      return { ok: response.ok, status: response.status, data };
+    };
 
-      if (!response.ok) {
-        const errorData: any = await response.json();
-        throw new Error(`Groq API error: ${errorData.error?.message || response.statusText}`);
+    const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+    // ── Attempt loop (runs at most twice: initial + one retry after 60-s wait) ──
+    for (let attempt = 1; attempt <= 2; attempt++) {
+
+      // Step 1: Primary model
+      const primary = await callApi(PRIMARY_MODEL);
+
+      if (primary.ok) {
+        return primary.data.choices?.[0]?.message?.content || '';
       }
 
-      const data: any = await response.json();
-      return data.choices?.[0]?.message?.content || '';
-    } catch (error) {
-      throw error;
+      if (primary.status === 429) {
+        const primaryMsg = primary.data?.error?.message || 'TPM rate limit';
+        console.warn(`[GroqProvider] 429 on primary model (${PRIMARY_MODEL}): ${primaryMsg}`);
+        console.log(`[GroqProvider] Falling back immediately to ${FALLBACK_MODEL}...`);
+
+        // Step 2: Fallback model (no wait)
+        const fallback = await callApi(FALLBACK_MODEL);
+
+        if (fallback.ok) {
+          console.log(`[GroqProvider] Fallback model (${FALLBACK_MODEL}) succeeded.`);
+          return fallback.data.choices?.[0]?.message?.content || '';
+        }
+
+        if (fallback.status === 429) {
+          const fallbackMsg = fallback.data?.error?.message || 'TPM rate limit';
+          console.warn(`[GroqProvider] 429 on fallback model (${FALLBACK_MODEL}): ${fallbackMsg}`);
+
+          if (attempt < 2) {
+            // Step 3: Both models rate-limited — wait 60 s then retry from Step 1
+            console.log(`[GroqProvider] Both models rate-limited. Waiting ${RETRY_WAIT_MS / 1000}s before retrying...`);
+            await sleep(RETRY_WAIT_MS);
+            console.log(`[GroqProvider] Resuming after ${RETRY_WAIT_MS / 1000}s wait — retrying primary model...`);
+            continue; // go to attempt 2
+          }
+
+          // Exhausted all retries
+          throw new Error(`Groq API error: ${fallbackMsg}`);
+        }
+
+        // Fallback returned a non-429 error
+        throw new Error(`Groq API error (fallback): ${fallback.data?.error?.message || fallback.status}`);
+      }
+
+      // Primary returned a non-429 error
+      throw new Error(`Groq API error: ${primary.data?.error?.message || primary.status}`);
     }
+
+    // Should never reach here
+    throw new Error('Groq API error: exhausted retry attempts');
   }
 
   getModelInfo(): Record<string, unknown> {

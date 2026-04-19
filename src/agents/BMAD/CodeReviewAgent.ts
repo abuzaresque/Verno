@@ -296,7 +296,16 @@ Be direct and specific. If the code is just skeleton/template code with empty bo
             }
 
             const packageJsonContent = fs.readFileSync(packageJsonPath, 'utf-8');
-            const packageJson = JSON.parse(packageJsonContent);
+
+            let packageJson: any;
+            try {
+                packageJson = JSON.parse(packageJsonContent);
+            } catch {
+                // package.json is malformed (e.g. corrupted by diff markers during code gen).
+                // Do not add a test failure issue for this — it's not a test issue.
+                this.log('package.json is not valid JSON (may be corrupted by diff markers) — skipping test execution', 'warn');
+                return 'Test execution skipped — package.json could not be parsed (check for diff marker corruption)';
+            }
 
             if (!packageJson.scripts?.test) {
                 return 'Test execution skipped — no test script in package.json';
@@ -319,6 +328,7 @@ Be direct and specific. If the code is just skeleton/template code with empty bo
             return `Tests: FAILED\n${errMsg}`;
         }
     }
+
 
     // ════════════════════════════════════════════
     // Report Builder
@@ -382,13 +392,66 @@ Be direct and specific. If the code is just skeleton/template code with empty bo
 
     private parseCodeFiles(content: string): Array<{ name: string; content: string }> {
         const files: Array<{ name: string; content: string }> = [];
-        const fileRegex = /```FILE:\s*([^\n]+)\n([\s\S]*?)```/g;
+        const seen = new Set<string>();
+
+        const extractNewCode = (rawContent: string) => {
+            const hunkRegex = /<{3,}[^\n]*\n[\s\S]*?={3,}[^\n]*\n([\s\S]*?)>{3,}/g;
+            let newCode = '';
+            let hunkMatch;
+            let found = false;
+            while ((hunkMatch = hunkRegex.exec(rawContent)) !== null) {
+                found = true;
+                newCode += hunkMatch[1].replace(/\n$/, '') + '\n\n';
+            }
+            return found ? newCode.trim() : rawContent;
+        };
+
+        const add = (name: string, rawContent: string) => {
+            const n = name.trim().replace(/^`+|`+$/g, '').trim();
+            if (!n || seen.has(n) || rawContent.trim().length === 0) { return; }
+            seen.add(n);
+            files.push({ name: n, content: extractNewCode(rawContent).trim() });
+        };
 
         let match;
-        while ((match = fileRegex.exec(content)) !== null) {
-            const filename = match[1].trim();
-            const filecontent = match[2].trim();
-            files.push({ name: filename, content: filecontent });
+
+        // Pass 0: ```diff FILE: ... ``` blocks
+        const diffRegex = /```diff\s*\n(?:FILE|EDIT):\s*([^\n]+)\s*\n([\s\S]*?)```/g;
+        while ((match = diffRegex.exec(content)) !== null) {
+            add(match[1], match[2]);
+        }
+
+        // Pass 1a: ```FILE: name\ncontent``` (inline fenced)
+        const inlineRegex = /```(?:FILE|EDIT):\s*([^\n]+)\n([\s\S]*?)```/g;
+        while ((match = inlineRegex.exec(content)) !== null) {
+            add(match[1], match[2]);
+        }
+
+        // Pass 1b: FILE: name\n```lang\ncontent``` (split fenced)
+        const splitRegex = /(?:^|\n)(?:FILE|EDIT):\s*([^\n]+)\s*\n+\s*```(?:\w+)?\s*\n([\s\S]*?)```/g;
+        while ((match = splitRegex.exec(content)) !== null) {
+            add(match[1], match[2]);
+        }
+
+        // Pass 1c: Bare FILE: / NEW FILE: blocks without backtick fences
+        const bareFileRegex =
+            /(?:^|\n)(?:#{1,6}\s+)?(?:NEW\s+)?(?:FILE|EDIT):\s*`?([^\n`]+?)`?\s*\n((?:(?!\n(?:#{0,6}\s+)?(?:NEW\s+)?(?:FILE|EDIT):|```)(?:.|\n))*)/gi;
+        while ((match = bareFileRegex.exec(content)) !== null) {
+            let filecontent = match[2].trim();
+            if (filecontent.startsWith('```') && filecontent.includes('\n')) {
+                filecontent = filecontent.replace(/^```(?:\w+)?\s*\n/, '').replace(/\n```\s*$/, '').trim();
+            }
+            add(match[1], filecontent);
+        }
+
+        // Pass 2: # file: / // file: raw headers
+        const rawFileRegex = /(?:^|\n)(?:#|\/\/)\s*file:\s*([^\n]+)\s*\n([\s\S]*?)(?=\n(?:#|\/\/)\s*file:|$)/gi;
+        while ((match = rawFileRegex.exec(content)) !== null) {
+            let filecontent = match[2].trim();
+            if (filecontent.startsWith('```') && filecontent.endsWith('```')) {
+                filecontent = filecontent.replace(/^```(?:\w+)?\s*\n/, '').replace(/\n```$/, '');
+            }
+            add(match[1], filecontent);
         }
 
         return files;

@@ -126,8 +126,20 @@ export class SecurityComplianceService {
      * Returns the most relevant OWASP Top 10 items for a given feature description.
      * Falls back to the 6-item baseline if no signals are detected.
      */
-    getOwaspItemsForFeature(featureText: string): OwaspItem[] {
-        const lower = featureText.toLowerCase();
+    getOwaspItemsForFeature(featureText: any): OwaspItem[] {
+        let extractedText = '';
+        if (typeof featureText === 'string') {
+            extractedText = featureText;
+        } else if (featureText && typeof featureText === 'object') {
+            extractedText = featureText.content || featureText.text || JSON.stringify(featureText);
+        }
+
+        if (typeof extractedText !== 'string' || !extractedText) {
+            // Fallback to baseline if text is missing or invalid
+            return ALL_OWASP_ITEMS.filter(item => OWASP_BASELINE_IDS.includes(item.id));
+        }
+
+        const lower = extractedText.toLowerCase();
         const matchedIds = new Set<string>();
 
         for (const mapping of FEATURE_OWASP_MAP) {
@@ -172,8 +184,21 @@ export class SecurityComplianceService {
      * Returns raw structured ComplianceFlag objects from arbitrary text.
      * Use this for programmatic processing (e.g., sidebar rendering).
      */
-    scanForFlags(text: string): ComplianceFlag[] {
-        const lower = text.toLowerCase();
+    scanForFlags(text: any): ComplianceFlag[] {
+        if (!text) return [];
+
+        let extractedText = '';
+        if (typeof text === 'string') {
+            extractedText = text;
+        } else if (typeof text === 'object') {
+            extractedText = text.content || text.text || JSON.stringify(text);
+        }
+
+        if (typeof extractedText !== 'string' || !extractedText) {
+            return [];
+        }
+
+        const lower = extractedText.toLowerCase();
         const flags: ComplianceFlag[] = [];
         const seen = new Set<string>();
 
@@ -215,13 +240,26 @@ export class SecurityComplianceService {
      */
     injectOwaspChecklist(sections: PRDSection[]): PRDSection[] {
         return sections.map(section => {
-            if (section.title.toLowerCase().includes('security')) {
+            const titleText = (typeof section.title === 'string') ? section.title : '';
+            if (titleText.toLowerCase().includes('security')) {
                 const owaspItems = this.getOwaspItemsForFeature(section.content);
                 const checklist = this.formatOwaspChecklist(owaspItems);
-                const hasOwasp = section.content.toLowerCase().includes('owasp') ||
-                                 section.content.toLowerCase().includes('a01:');
-                const content = hasOwasp ? section.content : section.content + checklist;
-                return { ...section, content };
+                
+                let contentText = '';
+                if (typeof section.content === 'string') {
+                    contentText = section.content;
+                } else if (section.content && typeof section.content === 'object') {
+                    contentText = (section.content as any).content || (section.content as any).text || JSON.stringify(section.content);
+                }
+
+                const hasOwasp = contentText.toLowerCase().includes('owasp') ||
+                                 contentText.toLowerCase().includes('a01:');
+                
+                // If it's an object, we want to attach the checklist securely to avoid blowing away the object struct.
+                // However, since PRDSection.content is structurally expected to be a string, we stringify it.
+                const newContent = hasOwasp ? section.content : contentText + checklist;
+                
+                return { ...section, content: newContent as any };
             }
             return section;
         });

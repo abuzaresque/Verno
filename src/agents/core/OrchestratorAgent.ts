@@ -40,6 +40,7 @@ import {
 } from '../../services/planning/PlanStateService';
 import { PRDDocument } from '../../types/sdlc';
 import { ContextBuilder } from '../../services/workflow/ContextBuilder';
+import { VernoArtifactService } from '../../services/artifact/VernoArtifactService';
 import * as vscode from 'vscode';
 
 /** Available agents the planner can assign */
@@ -121,7 +122,7 @@ export class OrchestratorAgent extends BaseAgent {
     await vscode.commands.executeCommand('verno.startSDLC', topic);
   }
 
-  public async onPRDApproved(prd: PRDDocument, context: vscode.ExtensionContext): Promise<void> {
+  public async onPRDApproved(prd: PRDDocument, context: vscode.ExtensionContext, agentPanel?: any): Promise<void> {
     this.log('PRD Approved. Triggering BMAD execution pipeline.');
     
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -143,9 +144,35 @@ export class OrchestratorAgent extends BaseAgent {
         .build();
 
     try {
-        await this.executePlan(agentContext);
-        vscode.window.showInformationMessage('BMAD Planning phase completed based on PRD!');
+        if (agentPanel) {
+            agentPanel.addMessage('system', '📝 **Phase 1: Planning** - Running Analysts & Architects to break down PRD...');
+        }
+
+        const planOutput = await this.executePlan(agentContext);
+        
+        if (agentPanel) {
+            agentPanel.showThinking(false);
+            agentPanel.addMessage('assistant', `**Plan Output:**\n\n${planOutput}`);
+            agentPanel.addMessage('system', '💻 **Phase 2: Coding** - Handing off to Developer and QA agents...');
+            agentPanel.showThinking(true);
+        }
+
+        // Automatically shift into CODE mode and execute the coding agents
+        agentContext.metadata!.mode = 'code';
+        const codeOutput = await this.executeCode(agentContext);
+
+        if (agentPanel) {
+            agentPanel.showThinking(false);
+            agentPanel.addMessage('assistant', `**Execution Complete:**\n\n${codeOutput}`);
+            agentPanel.addMessage('system', '✅ **BMAD Pipeline Finished!** Your codebase has been updated.');
+        }
+
+        vscode.window.showInformationMessage('BMAD Pipeline fully completed!');
     } catch (err: any) {
+        if (agentPanel) {
+            agentPanel.showThinking(false);
+            agentPanel.addMessage('system', `❌ BMAD Pipeline failed: ${err.message}`);
+        }
         vscode.window.showErrorMessage(`BMAD Pipeline failed: ${err.message}`);
     }
   }
@@ -422,6 +449,38 @@ export class OrchestratorAgent extends BaseAgent {
 
       this.log(`Running CODE step: ${step.agentName} — ${step.task}`);
 
+      // ── Enrich developer task with sprint story details ─────────────────
+      let enrichedUserRequest = `${step.task}\n\nOriginal Request: ${planState.userRequest}`;
+      if (step.agentId === 'developer' && context.workspaceRoot) {
+        try {
+          const artifacts = new VernoArtifactService(context.workspaceRoot);
+          const sprintPlan = artifacts.readJSON<any>('sprint-plan.json');
+          if (sprintPlan && Array.isArray(sprintPlan.sprints) && sprintPlan.sprints.length > 0) {
+            const activeSprint = sprintPlan.sprints[0];
+            // Try to match the step task to a sprint story by ID or title keyword
+            const matchedStory = activeSprint.stories?.find((s: any) => {
+              const storyId = s.id ?? '';
+              const storyTitle = s.title ?? s.name ?? '';
+              return step.task.includes(storyId) || step.task.toLowerCase().includes(storyTitle.toLowerCase().substring(0, 20));
+            }) ?? activeSprint.stories?.[0]; // fallback: first story
+
+            if (matchedStory) {
+              const ac = Array.isArray(matchedStory.acceptanceCriteria)
+                ? matchedStory.acceptanceCriteria.map((c: string, i: number) => `  ${i + 1}. ${c}`).join('\n')
+                : 'Not specified';
+              enrichedUserRequest =
+                `Implement Sprint Story [${matchedStory.id ?? 'S-?'}]: ${matchedStory.title ?? matchedStory.name ?? step.task}\n\n` +
+                `Description: ${matchedStory.description ?? 'No description'}\n\n` +
+                `Acceptance Criteria:\n${ac}\n\n` +
+                `Original PRD Request: ${planState.userRequest}`;
+              this.log(`[OrchestratorAgent] Developer task enriched with story: ${matchedStory.id} — ${matchedStory.title}`);
+            }
+          }
+        } catch (enrichErr: any) {
+          this.log(`Could not load sprint plan for task enrichment (non-fatal): ${enrichErr?.message ?? enrichErr}`, 'warn');
+        }
+      }
+
       const agentContext: IAgentContext = {
         workspaceRoot: context.workspaceRoot,
         selectedText: context.selectedText,
@@ -429,8 +488,7 @@ export class OrchestratorAgent extends BaseAgent {
         fileContent: context.fileContent,
         metadata: {
           ...context.metadata,
-          // Use the plan step's task as the primary request, with the original plan request as context
-          userRequest: `${step.task}\n\nOriginal Request: ${planState.userRequest}`,
+          userRequest: enrichedUserRequest,
           previousOutputs: agentOutputs,
           conversationHistory,
           projectContext,
@@ -540,10 +598,22 @@ export class OrchestratorAgent extends BaseAgent {
         this.planStateService.markStepComplete('codereview', reviewResult);
       }
 
-      // If review found skeleton code, retry DeveloperAgent once with feedback
-      if (reviewResult.includes('FAIL') && reviewResult.includes('keleton')) {
-        this.log('Review detected skeleton code — retrying DeveloperAgent with feedback...');
-        results.push(`\n## 🔄 Retrying Code Generation (skeleton code detected)\n`);
+      // If review verdict is FAIL or NEEDS FIXES, retry developer once with full feedback
+      // Check the actual **Verdict:** line that CodeReviewAgent.buildReport() writes,
+      // not incidental words (e.g. "Skeleton Code Detection" heading or "Tests: FAILED").
+      const verdictNeedsFix =
+        reviewResult.includes('Verdict: FAIL') ||
+        reviewResult.includes('Verdict: NEEDS FIXES') ||
+        reviewResult.includes('VERDICT: FAIL') ||
+        reviewResult.includes('VERDICT: NEEDS_FIXES');
+
+      if (verdictNeedsFix) {
+        const triggerReason = reviewResult.includes('Verdict: FAIL') || reviewResult.includes('VERDICT: FAIL')
+          ? 'skeleton or critical code issues'
+          : 'quality issues found (NEEDS FIXES)';
+        this.log(`Review verdict requires fix — retrying DeveloperAgent (reason: ${triggerReason})...`);
+        results.push(`\n## 🔄 Retrying Code Generation (${triggerReason})\\n`);
+
 
         const devAgent = this.agentRegistry.get('developer');
         if (devAgent) {
@@ -719,9 +789,43 @@ export class OrchestratorAgent extends BaseAgent {
       }
     }
 
+    // ── Load SDLC artifacts: PRD and Sprint Plan ────────────────────────────
+    let prdSection = '';
+    let sprintSection = '';
+    if (workspaceRoot) {
+      const artifacts = new VernoArtifactService(workspaceRoot);
+
+      // Read approved PRD
+      const prd = artifacts.readJSON<PRDDocument>('prd.json');
+      if (prd && prd.sections && prd.sections.length > 0) {
+        this.log(`[OrchestratorAgent] Loaded PRD: ${prd.sections.length} sections`);
+        const prdText = prd.sections
+          .map(s => `### ${s.title}\n${s.content}`)
+          .join('\n\n')
+          .substring(0, 3000); // token budget guard
+        prdSection = `\n## Approved PRD\nThe following PRD was approved by the user. Your plan MUST implement it faithfully.\n\n${prdText}`;
+      }
+
+      // Read Sprint Plan — extract Sprint 1 stories (current sprint)
+      const sprintPlan = artifacts.readJSON<any>('sprint-plan.json');
+      if (sprintPlan && Array.isArray(sprintPlan.sprints) && sprintPlan.sprints.length > 0) {
+        // Use Sprint 1 (index 0) as the active sprint
+        const activeSprint = sprintPlan.sprints[0];
+        this.log(`[OrchestratorAgent] Loaded Sprint Plan: ${activeSprint.stories?.length ?? 0} stories in ${activeSprint.name}`);
+        if (activeSprint.stories && activeSprint.stories.length > 0) {
+          const storyLines = activeSprint.stories.map((s: any, i: number) =>
+            `${i + 1}. [${s.id ?? `S-${i + 1}`}] ${s.title ?? s.name ?? 'Story'} (${s.storyPoints ?? '?'} pts)\n   ${s.description ?? ''}\n   AC: ${Array.isArray(s.acceptanceCriteria) ? s.acceptanceCriteria.join('; ') : 'N/A'}`
+          ).join('\n\n');
+          sprintSection = `\n## Active Sprint: ${activeSprint.name}\nThese are the stories committed for the current sprint. The developer steps MUST each implement one story, named as:\n  "task": "Implement [Story ID] — [Story Title]"\n\n${storyLines}`;
+        }
+      }
+    }
+
     const agentList = Object.entries(AVAILABLE_AGENTS)
       .map(([id, desc]) => `  - "${id}": ${desc}`)
       .join('\n');
+
+    const hasSprintStories = sprintSection.length > 0;
 
     const planPrompt = `You are an expert software project planner (the Orchestrator). Analyze the user's request and create an execution plan.
 
@@ -737,12 +841,13 @@ ${agentList}
 6. If the user is just asking a question or for clarification, return an empty steps array and put your conversational response in "summary".
 7. Consider the current project state below — plan for MODIFICATIONS to existing code, not greenfield creation, if files already exist.
 8. IMPORTANT: Each agent can appear AT MOST ONCE in the plan. Do NOT duplicate agents.
+${hasSprintStories ? '9. CRITICAL: An Approved PRD and Sprint Plan exist (see below). You MUST align every step to the sprint stories. The developer task MUST reference the story ID and title.' : ''}
 
 ## Project Context (Current Repository State)
-${projectContext || 'No project context available (new project)'}
+${projectContext || 'No project context available (new project)'}${prdSection}${sprintSection}
 
 ## Conversation History
-${conversationHistory ? conversationHistory.substring(0, 3000) : 'No previous conversation'}
+${conversationHistory ? conversationHistory.substring(0, 2000) : 'No previous conversation'}
 
 ## User Request
 ${userRequest}
@@ -754,7 +859,7 @@ Respond with ONLY valid JSON (no markdown fencing):
   "steps": [
     { "step": 1, "agentId": "analyst", "agentName": "Business Analyst", "task": "Analyze requirements for...", "reason": "Need to understand..." },
     { "step": 2, "agentId": "architect", "agentName": "System Architect", "task": "Design architecture for...", "reason": "Need system design..." },
-    { "step": 3, "agentId": "developer", "agentName": "Developer", "task": "Implement code for...", "reason": "Generate the actual code" }
+    { "step": 3, "agentId": "developer", "agentName": "Developer", "task": "Implement [S-001] — Product listing page with filtering", "reason": "Implements Sprint 1 Story S-001" }
   ]
 }`;
 

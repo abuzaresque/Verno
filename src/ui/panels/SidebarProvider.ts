@@ -13,7 +13,7 @@ const SIDEBAR_ALLOWED_TYPES = [
     'processInputSubmit', 'start-sdlc', 'newTask', 'listConversations',
     'loadConversation', 'deleteConversation', 'mcpInstall', 'triggerUpload',
     'startRecording', 'vadAudioData', 'stopRecording', 'voiceConversationComplete',
-    'voiceSessionEnded', 'log', 'showOutput', 'webviewReady'
+    'voiceSessionEnded', 'log', 'showOutput', 'webviewReady', 'saveApiKey', 'deleteApiKey'
 ] as const;
 
 export class SidebarProvider implements vscode.WebviewViewProvider {
@@ -62,7 +62,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                     await vscode.commands.executeCommand('verno.processInputWithData', data.apiKey, data.input, data.mode, data.provider, data.model);
                     break;
                 case 'start-sdlc':
-                    await vscode.commands.executeCommand('verno.startSDLC', data.input);
+                    await vscode.commands.executeCommand('verno.startSDLC', data.input, data.apiKey, data.provider);
                     break;
                 case 'newTask':
                     await vscode.commands.executeCommand('verno.newTask');
@@ -165,12 +165,24 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 case 'showOutput':
                     await vscode.commands.executeCommand('verno.showOutput');
                     break;
+                case 'saveApiKey':
+                    await vscode.commands.executeCommand('verno.saveApiKey', data.provider, data.apiKey);
+                    webviewView.webview.postMessage({ type: 'apiKeySaved', provider: data.provider });
+                    break;
+                case 'deleteApiKey':
+                    await vscode.commands.executeCommand('verno.deleteApiKey', data.provider);
+                    webviewView.webview.postMessage({ type: 'apiKeyDeleted', provider: data.provider });
+                    break;
                 case 'webviewReady':
                     this.logger.info('[Sidebar] Webview ready signal received');
                     if (this.isVoiceSessionActive) {
                         this.logger.info('[Sidebar] Restoring active voice session state...');
                         webviewView.webview.postMessage({ type: 'restoreVoiceSession' });
                     }
+                    // Bug 2 fix: eagerly initialize the LLM provider on webview mount
+                    // so that "Start SDLC" works on the very first click without
+                    // requiring a "Send" message to be dispatched first.
+                    await vscode.commands.executeCommand('verno.ensureLLMReady');
                     break;
             }
         });

@@ -148,7 +148,12 @@ export async function activate(context: vscode.ExtensionContext) {
 		context.subscriptions.push(
 			vscode.window.registerWebviewViewProvider(
 				SidebarProvider.viewType,
-				sidebarProvider
+				sidebarProvider,
+				{
+					// Keep the webview alive when the sidebar is hidden so that DOM/chat
+					// history is never destroyed and re-created on panel switch (Bug 1 fix).
+					webviewOptions: { retainContextWhenHidden: true }
+				}
 			)
 		);
 		logger.info('Sidebar provider registered');
@@ -182,7 +187,7 @@ export async function activate(context: vscode.ExtensionContext) {
 		StopRecordingCommand.register(context);
 		ManageAgentsCommand.register(context);
 		registerSecurityCommands(context, logger);
-		
+
 		// Phase 10: Secret Scanner commands + status bar
 		registerSecretScanCommands(context, logger);
 
@@ -221,12 +226,60 @@ export async function activate(context: vscode.ExtensionContext) {
 		});
 
 		// Register SDLC Start command — runs inline in sidebar chat (Kilo Code style)
-		const startSDLCCmd = vscode.commands.registerCommand('verno.startSDLC', async (topic?: string) => {
+		const startSDLCCmd = vscode.commands.registerCommand('verno.startSDLC', async (topic?: string, apiKeyArg?: string, providerArg?: string) => {
+			// If the frontend passed an API key (e.g. user just typed it), save it instantly
+			// and pre-initialize the LLM service to guarantee ensureLLMStatus passes.
+			if (apiKeyArg) {
+				const providerName = providerArg || await configService.getSelectedProvider() || 'groq';
+				await configService.storeApiKey(providerName as any, apiKeyArg);
+				await configService.storeSelectedProvider(providerName);
+
+				if (!llmService.isInitialized()) {
+					const provider = providerName === 'anthropic' ? new AnthropicProvider()
+						: providerName === 'openai' ? new OpenAIProvider()
+							: providerName === 'gemini' ? new GeminiProvider()
+								: new GroqProvider();
+					await provider.initialize(apiKeyArg);
+					llmService.setProvider(provider);
+				}
+			}
+
 			const ok = await ensureLLMStatus(context);
 			if (!ok) {
 				vscode.window.showErrorMessage('Verno: No LLM provider found. Please configure an API key via the Profile button.');
 				return;
 			}
+
+			// --- PRD Persistence & Resumption Check ---
+			const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+			if (workspaceRoot) {
+				try {
+					const { VernoArtifactService } = require('./services/artifact/VernoArtifactService');
+					const artifacts = new VernoArtifactService(workspaceRoot);
+					const existingPrd = artifacts.readJSON('prd.json');
+
+					if (existingPrd && existingPrd.title && Array.isArray(existingPrd.sections) && existingPrd.sections.length > 0) {
+						const resumeChoice = await vscode.window.showInformationMessage(
+							`An existing PRD was found: "${existingPrd.title}". Do you want to resume the SDLC workflow or start a new debate?`,
+							'Resume Workflow',
+							'Start New Debate'
+						);
+
+						if (resumeChoice === 'Resume Workflow') {
+							agentPanel.showThinking(false);
+							agentPanel.addMessage('system', `✅ Resuming SDLC pipeline from saved state: **${existingPrd.title}**...\n\nOpening PRD review panel…`);
+							// Bypass the DebateOrchestrator and jump straight to the Webview Phase
+							const { SDLCWebviewPanel } = require('./panels/SDLCWebviewPanel');
+							SDLCWebviewPanel.createOrShow(context, logger, llmService, undefined, existingPrd);
+							return;
+						}
+					}
+				} catch (err) {
+					logger.warn(`Failed to read existing PRD from workspace: ${err}`);
+				}
+			}
+			// -----------------------------------------
+
 			if (!topic || topic.trim().length === 0) {
 				topic = await vscode.window.showInputBox({
 					prompt: 'What are we building? Describe the feature or application.',
@@ -284,7 +337,19 @@ export async function activate(context: vscode.ExtensionContext) {
 		const startBMADCmd = vscode.commands.registerCommand('verno.startBMADAfterSDLC', async (prd: PRDDocument) => {
 			const orchestrator = agentRegistry.get('orchestrator') as OrchestratorAgent;
 			if (orchestrator) {
-				await orchestrator.onPRDApproved(prd, context);
+				agentPanel.showThinking(true);
+				agentPanel.addMessage('system', '⚙️ **BMAD Pipeline Initiated!** Transferring PRD to agent swarm...');
+
+				// Dispose of the SDLC Webview so the user's focus returns to the sidebar where BMAD output streams
+				try {
+					if (SDLCWebviewPanel.currentPanel) {
+						SDLCWebviewPanel.currentPanel.dispose();
+					}
+				} catch (e) {
+					logger.error('Failed to close SDLC panel', e as Error);
+				}
+
+				await orchestrator.onPRDApproved(prd, context, agentPanel);
 			}
 		});
 
@@ -426,6 +491,27 @@ export async function activate(context: vscode.ExtensionContext) {
 			vscode.window.showInformationMessage(`Cleared keys for: ${selected.join(', ')}`);
 		});
 
+		// Secret storage commands directly triggered from Webview
+		const saveApiKeyCmd = vscode.commands.registerCommand('verno.saveApiKey', async (providerName: string, apiKey: string) => {
+			await configService.storeApiKey(providerName as any, apiKey);
+			const provider = providerName === 'anthropic' ? new AnthropicProvider()
+				: providerName === 'openai' ? new OpenAIProvider()
+					: providerName === 'gemini' ? new GeminiProvider()
+						: new GroqProvider();
+			
+			await provider.initialize(apiKey);
+			llmService.setProvider(provider);
+			logger.info(`LLM provider re-initialized for ${providerName}`);
+		});
+
+		const deleteApiKeyCmd = vscode.commands.registerCommand('verno.deleteApiKey', async (providerName: string) => {
+			await configService.deleteApiKey(providerName as any);
+			logger.info(`API Key deleted and memory cleared for ${providerName}`);
+			
+			// Optional: We can simply wait for the next initialization
+			// or force clear the active instance if it's the one we just deleted
+		});
+
 		// Phase 9: Observability — generate OTel, Grafana, and Runbook artifacts
 		const generateObservabilityCmd = vscode.commands.registerCommand('verno.generateObservability', async () => {
 			if (!workspaceRoot) {
@@ -472,7 +558,19 @@ export async function activate(context: vscode.ExtensionContext) {
 			vscode.window.showInformationMessage(`Verno mode: ${vernoMode === 'chat' ? '💬 Conversational' : '🏗️ SDLC Pipeline'}`);
 		});
 
-		context.subscriptions.push(processCommand, processWithData, showOutputCmd, recordingStatus, loadConversationCmd, newTaskCmd, mcpInstallCmd, listConvsCmd, deleteConvCmd, voiceConvCmd, processVoiceCmd, newConversationCmd, startSDLCCmd, startBMADCmd, clearApiKeysCmd, generateObservabilityCmd, toggleModeCmd, modeToggle);
+		context.subscriptions.push(processCommand, processWithData, showOutputCmd, recordingStatus, loadConversationCmd, newTaskCmd, mcpInstallCmd, listConvsCmd, deleteConvCmd, voiceConvCmd, processVoiceCmd, newConversationCmd, startSDLCCmd, startBMADCmd, clearApiKeysCmd, saveApiKeyCmd, deleteApiKeyCmd, generateObservabilityCmd, toggleModeCmd, modeToggle);
+
+		// Bug 2 fix: command that SidebarProvider calls on webview mount to eagerly
+		// initialize the LLM provider before the user clicks any button.
+		const ensureLLMReadyCmd = vscode.commands.registerCommand('verno.ensureLLMReady', async () => {
+			const ok = await ensureLLMStatus(context);
+			if (ok) {
+				logger.info('[ensureLLMReady] LLM provider ready.');
+			} else {
+				logger.warn('[ensureLLMReady] No API key found — user must configure one via the Profile button.');
+			}
+		});
+		context.subscriptions.push(ensureLLMReadyCmd);
 
 		logger.info('Verno extension activated successfully');
 		vscode.window.showInformationMessage('Verno extension is ready!');
@@ -558,6 +656,11 @@ async function processUserInput(
 			await configService.storeSelectedModel(providerName, modelName);
 		}
 
+		// Sync the key from the UI into secure storage if it was passed explicitly
+		if (apiKeyArg) {
+			await configService.storeApiKey(providerName as any, apiKeyArg);
+		}
+
 		// Retrieve API key from SecretStorage — only prompt if not yet stored
 		if (!apiKey) {
 			apiKey = await configService.getApiKey(providerName as 'gemini' | 'groq' | 'anthropic' | 'openai')
@@ -582,7 +685,7 @@ async function processUserInput(
 				await configService.storeSelectedProvider(providerName);
 			}
 		}
-		
+
 		if (!apiKey) {
 			vscode.window.showErrorMessage('No API key found. Please configure one in Verno settings.');
 			return;
@@ -676,7 +779,7 @@ async function processUserInput(
 			// Plan mode detection: Should we trigger SDLC?
 			const lowerInput = input.toLowerCase();
 			const looksLikeProject = lowerInput.includes('build a') || lowerInput.includes('create a new') || lowerInput.includes('create an app') || input.split(' ').length > 50;
-			
+
 			if (looksLikeProject) {
 				const choice = await vscode.window.showInformationMessage('This looks like a large feature or project request. Would you like to run the SDLC Flow (PRD Generation + Jira Sync) first?', 'Yes, run SDLC', 'No, just generate code');
 				if (choice === 'Yes, run SDLC') {
@@ -783,22 +886,45 @@ async function ensureLLMStatus(context: vscode.ExtensionContext): Promise<boolea
 	if (llmService.isInitialized()) return true;
 
 	try {
-		// Attempt to load from ConfigService (secure storage)
-		let providerName = await configService.getSelectedProvider() || 'groq';
-		let apiKey = await configService.getApiKey(providerName as 'groq' | 'gemini');
+		// Check all known providers in priority order — this mirrors what
+		// processUserInput does so the SDLC button works on the first click
+		// even before the user has sent a regular message (Bug 2 fix).
+		const providerPriority: Array<{ name: 'anthropic' | 'openai' | 'gemini' | 'groq'; factory: () => import('./types').ILLMProvider }> = [
+			{ name: 'anthropic', factory: () => new AnthropicProvider() },
+			{ name: 'openai', factory: () => new OpenAIProvider() },
+			{ name: 'gemini', factory: () => new GeminiProvider() },
+			{ name: 'groq', factory: () => new GroqProvider() },
+		];
 
-		if (!apiKey) {
-			// Fallback to process.env
-			apiKey = process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY || '';
-			if (apiKey) {
-				providerName = apiKey.startsWith('gsk_') ? 'groq' : 'gemini';
+		// Also respect the user's preferred provider (check it first)
+		const selectedProvider = await configService.getSelectedProvider();
+		if (selectedProvider) {
+			const idx = providerPriority.findIndex(p => p.name === selectedProvider);
+			if (idx > 0) {
+				const [preferred] = providerPriority.splice(idx, 1);
+				providerPriority.unshift(preferred);
 			}
 		}
 
-		if (apiKey) {
-			const provider = providerName === 'groq' ? new GroqProvider() : new GeminiProvider();
-			await provider.initialize(apiKey);
+		for (const { name, factory } of providerPriority) {
+			const apiKey = await configService.getApiKey(name);
+			if (apiKey) {
+				const provider = factory();
+				await provider.initialize(apiKey);
+				llmService.setProvider(provider);
+				logger.info(`[ensureLLMStatus] Initialized with stored ${name} key.`);
+				return true;
+			}
+		}
+
+		// Last resort: environment variable
+		const envKey = process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY || '';
+		if (envKey) {
+			const provName = envKey.startsWith('gsk_') ? 'groq' : 'gemini';
+			const provider = provName === 'groq' ? new GroqProvider() : new GeminiProvider();
+			await provider.initialize(envKey);
 			llmService.setProvider(provider);
+			logger.info(`[ensureLLMStatus] Initialized from environment (${provName}).`);
 			return true;
 		}
 	} catch (err) {
