@@ -10,7 +10,7 @@ suite('Extension Test Suite', () => {
 
   test('Extension activation', async function() {
     this.timeout(10000); // Increase timeout to 10 seconds
-    const ext = vscode.extensions.getExtension('yourname.verno');
+    const ext = vscode.extensions.getExtension('verno-ai.verno');
     assert.ok(ext, 'Extension should be found');
 
     await ext?.activate();

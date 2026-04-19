@@ -14,7 +14,6 @@ async function main() {
     await runTests({
       extensionDevelopmentPath,
       extensionTestsPath,
-      vscodeExecutablePath: 'C:\Users\DELL\Desktop\CS101\FYP\verno\.vscode-test\vscode-win32-x64-archive-1.109.0\Code.exe',
     });
   } catch (err) {
     console.error('Failed to run tests');
